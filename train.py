@@ -61,10 +61,10 @@ METRIC_TOLERANCE = 1e-6
 @dataclass
 class ExperimentConfig:
     # Edit this block between experiments.
-    description: str = "baseline [1/1] pade"
-    pade_m: int = 1
+    description: str = "local search [2/1] pade"
+    pade_m: int = 2
     pade_n: int = 1
-    max_order: int = 4
+    max_order: int = 3
     interval: int = 4
     enable_pade: bool = True
     total_images: int = 200
