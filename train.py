@@ -61,13 +61,13 @@ METRIC_TOLERANCE = 1e-6
 @dataclass
 class ExperimentConfig:
     # Edit this block between experiments.
-    description: str = "retry [2/1] pade"
+    description: str = "rerun [2/1] pade"
     pade_m: int = 2
     pade_n: int = 1
     max_order: int = 3
     interval: int = 4
     enable_pade: bool = True
-    total_images: int = 100
+    total_images: int = 200
     batch_size: int = 2
     seed: int = 42
     cfg_scale: float = 1.5
