@@ -295,7 +295,18 @@ def run_checked(command: list[str], *, cwd: Path | None = None) -> subprocess.Co
     )
 
 
+def train_py_has_uncommitted_changes() -> bool:
+    result = subprocess.run(
+        ["git", "-C", str(ROOT), "diff", "--quiet", "--", str(TRAIN_PY)],
+        check=False,
+    )
+    return result.returncode == 1
+
+
 def commit_train_config(candidate: Candidate) -> None:
+    if not train_py_has_uncommitted_changes():
+        print("[loop] train.py already at requested config; skipping commit", flush=True)
+        return
     run_checked(["git", "-C", str(ROOT), "add", str(TRAIN_PY)])
     message = (
         f"auto pade m{candidate.pade_m} n{candidate.pade_n} "
