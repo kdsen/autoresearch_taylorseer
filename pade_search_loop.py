@@ -81,30 +81,49 @@ def config_key_from_row(row: dict[str, str]) -> tuple[int, int, int, int, bool, 
     )
 
 
-def load_latest_run_summary() -> tuple[Path | None, dict[str, object] | None]:
+def load_json(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_latest_run_summary() -> tuple[Path | None, dict[str, object] | None, dict[str, object] | None]:
     if not RUNS_DIR.exists():
-        return None, None
+        return None, None, None
     run_dirs = [path for path in RUNS_DIR.iterdir() if path.is_dir()]
     if not run_dirs:
-        return None, None
+        return None, None, None
+
+    completed_dirs = [path for path in run_dirs if (path / "train_summary.json").exists()]
+    if completed_dirs:
+        latest_dir = max(completed_dirs, key=lambda path: path.name)
+        return (
+            latest_dir,
+            load_json(latest_dir / "train_summary.json"),
+            load_json(latest_dir / "approx_stats.json"),
+        )
+
     latest_dir = max(run_dirs, key=lambda path: path.name)
-    summary_path = latest_dir / "train_summary.json"
-    if not summary_path.exists():
-        return latest_dir, None
-    with summary_path.open("r", encoding="utf-8") as handle:
-        return latest_dir, json.load(handle)
+    return latest_dir, None, None
 
 
-def latest_ratio(summary: dict[str, object] | None, field: str) -> float | None:
-    if not summary:
-        return None
-    value = summary.get(field)
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+def latest_ratio(
+    summary: dict[str, object] | None,
+    approx_stats: dict[str, object] | None,
+    field: str,
+) -> float | None:
+    for payload in (approx_stats, summary):
+        if not payload:
+            continue
+        value = payload.get(field)
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
 
 
 def make_candidate(
@@ -215,6 +234,7 @@ def choose_next_candidate(
     rows: list[dict[str, str]],
     best_row: dict[str, str] | None,
     latest_summary: dict[str, object] | None,
+    latest_approx_stats: dict[str, object] | None,
 ) -> Candidate:
     tried = {config_key_from_row(row) for row in rows}
 
@@ -225,8 +245,8 @@ def choose_next_candidate(
     if best_row is None:
         return make_candidate("auto baseline [1/1] pade 100img", 1, 1)
 
-    pade_step_ratio = latest_ratio(latest_summary, "pade_step_ratio")
-    pade_call_ratio = latest_ratio(latest_summary, "pade_call_ratio")
+    pade_step_ratio = latest_ratio(latest_summary, latest_approx_stats, "pade_step_ratio")
+    pade_call_ratio = latest_ratio(latest_summary, latest_approx_stats, "pade_call_ratio")
     ratios_low = (
         pade_step_ratio is not None
         and pade_call_ratio is not None
@@ -339,6 +359,7 @@ def print_iteration_state(
     best_row: dict[str, str] | None,
     latest_dir: Path | None,
     latest_summary: dict[str, object] | None,
+    latest_approx_stats: dict[str, object] | None,
 ) -> None:
     print(f"[loop] iteration={iteration}", flush=True)
     print(f"[loop] results_rows={len(rows)}", flush=True)
@@ -362,11 +383,12 @@ def print_iteration_state(
     if latest_summary is not None:
         status = latest_summary.get("status", "")
         lpips = latest_summary.get("lpips", "")
-        step_ratio = latest_summary.get("pade_step_ratio", "n/a")
-        call_ratio = latest_summary.get("pade_call_ratio", "n/a")
+        step_ratio = latest_ratio(latest_summary, latest_approx_stats, "pade_step_ratio")
+        call_ratio = latest_ratio(latest_summary, latest_approx_stats, "pade_call_ratio")
         print(
             f"[loop] latest_status={status} lpips={lpips} "
-            f"pade_step_ratio={step_ratio} pade_call_ratio={call_ratio}",
+            f"pade_step_ratio={step_ratio if step_ratio is not None else 'n/a'} "
+            f"pade_call_ratio={call_ratio if call_ratio is not None else 'n/a'}",
             flush=True,
         )
 
@@ -376,10 +398,17 @@ def main() -> int:
     while True:
         rows = read_results()
         best_row = best_keep_row(rows)
-        latest_dir, latest_summary = load_latest_run_summary()
-        print_iteration_state(iteration, rows, best_row, latest_dir, latest_summary)
+        latest_dir, latest_summary, latest_approx_stats = load_latest_run_summary()
+        print_iteration_state(
+            iteration,
+            rows,
+            best_row,
+            latest_dir,
+            latest_summary,
+            latest_approx_stats,
+        )
 
-        candidate = choose_next_candidate(rows, best_row, latest_summary)
+        candidate = choose_next_candidate(rows, best_row, latest_summary, latest_approx_stats)
         print(
             "[loop] next_candidate="
             f"m{candidate.pade_m} n{candidate.pade_n} "
