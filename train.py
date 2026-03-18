@@ -71,13 +71,13 @@ METRIC_TOLERANCE = 1e-6
 @dataclass
 class ExperimentConfig:
     # Edit this block between experiments.
-    description: str = "auto candidate [4/1] pade 100img"
-    pade_m: int = 4
-    pade_n: int = 1
-    max_order: int = 5
+    description: str = "auto relax single-step [1/2] pade 100img"
+    pade_m: int = 1
+    pade_n: int = 2
+    max_order: int = 3
     interval: int = 4
     enable_pade: bool = True
-    pade_only_single_step: bool = True
+    pade_only_single_step: bool = False
     pade_denom_threshold: float = 0.0001
     total_images: int = 100
     batch_size: int = 2
