@@ -260,7 +260,7 @@ def choose_next_candidate(
 
 def replace_field(text: str, field: str, value: str) -> str:
     pattern = re.compile(rf"^(\s*{field}:\s*[^=]+=\s*).*$", re.MULTILINE)
-    updated, count = pattern.subn(rf"\1{value}", text, count=1)
+    updated, count = pattern.subn(lambda match: f"{match.group(1)}{value}", text, count=1)
     if count != 1:
         raise RuntimeError(f"Could not update {field} in train.py")
     return updated
