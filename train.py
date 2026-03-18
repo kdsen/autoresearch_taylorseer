@@ -41,12 +41,22 @@ RESULT_FIELDS = [
     "pade_n",
     "max_order",
     "interval",
+    "pade_only_single_step",
+    "pade_denom_threshold",
     "lpips",
     "relative_l1",
     "ssim",
     "rmse",
     "psnr",
     "cosine",
+    "approx_total_steps",
+    "pade_steps",
+    "taylor_steps",
+    "mixed_steps",
+    "pade_calls",
+    "taylor_calls",
+    "pade_step_ratio",
+    "pade_call_ratio",
     "status",
     "description",
     "sample_seconds",
@@ -61,12 +71,14 @@ METRIC_TOLERANCE = 1e-6
 @dataclass
 class ExperimentConfig:
     # Edit this block between experiments.
-    description: str = "candidate [1/2] pade 100img"
-    pade_m: int = 1
+    description: str = "auto candidate [2/2] pade 100img"
+    pade_m: int = 2
     pade_n: int = 2
-    max_order: int = 3
+    max_order: int = 4
     interval: int = 4
     enable_pade: bool = True
+    pade_only_single_step: bool = True
+    pade_denom_threshold: float = 0.0001
     total_images: int = 100
     batch_size: int = 2
     seed: int = 42
@@ -86,12 +98,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pade-n", type=int, default=None)
     parser.add_argument("--max-order", type=int, default=None)
     parser.add_argument("--interval", type=int, default=None)
+    parser.add_argument("--pade-denom-threshold", type=float, default=None)
     parser.add_argument("--total-images", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--cfg-scale", type=float, default=None)
     parser.add_argument("--num-sampling-steps", type=int, default=None)
     parser.add_argument("--timeout-seconds", type=int, default=None)
+    parser.add_argument(
+        "--pade-only-single-step",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument(
         "--archive-images",
         action=argparse.BooleanOptionalAction,
@@ -109,6 +127,7 @@ def merge_config(args: argparse.Namespace) -> ExperimentConfig:
         ("pade_n", "pade_n"),
         ("max_order", "max_order"),
         ("interval", "interval"),
+        ("pade_denom_threshold", "pade_denom_threshold"),
         ("total_images", "total_images"),
         ("batch_size", "batch_size"),
         ("seed", "seed"),
@@ -120,6 +139,8 @@ def merge_config(args: argparse.Namespace) -> ExperimentConfig:
         if value is not None:
             setattr(config, field_name, value)
 
+    if args.pade_only_single_step is not None:
+        config.pade_only_single_step = args.pade_only_single_step
     if args.archive_images is not None:
         config.archive_images = args.archive_images
     if args.disable_pade:
@@ -132,6 +153,8 @@ def merge_config(args: argparse.Namespace) -> ExperimentConfig:
             f"max_order={config.max_order} must be at least pade_m + pade_n = "
             f"{config.pade_m + config.pade_n}"
         )
+    if config.pade_denom_threshold <= 0:
+        raise ValueError("pade_denom_threshold must be > 0")
 
     return config
 
@@ -150,12 +173,26 @@ def ensure_paths_exist() -> None:
 
 
 def ensure_results_tsv() -> None:
-    if RESULTS_TSV.exists():
+    if not RESULTS_TSV.exists():
+        RESULTS_TSV.parent.mkdir(parents=True, exist_ok=True)
+        with RESULTS_TSV.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS, delimiter="\t")
+            writer.writeheader()
         return
-    RESULTS_TSV.parent.mkdir(parents=True, exist_ok=True)
+
+    with RESULTS_TSV.open("r", newline="", encoding="utf-8") as handle:
+        first_line = handle.readline().rstrip("\n")
+        if first_line.split("\t") == RESULT_FIELDS:
+            return
+        handle.seek(0)
+        reader = csv.DictReader(handle, delimiter="\t")
+        rows = list(reader)
+
     with RESULTS_TSV.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS, delimiter="\t")
         writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in RESULT_FIELDS})
 
 
 def git_value(*args: str) -> str:
@@ -172,7 +209,7 @@ def git_value(*args: str) -> str:
 
 def cleanup_sample_output() -> None:
     SAMPLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for pattern in ("*.png", "eval.txt", "eval_metrics.json", "train_summary.json"):
+    for pattern in ("*.png", "eval.txt", "eval_metrics.json", "train_summary.json", "approx_stats.json"):
         for path in SAMPLE_OUTPUT_DIR.glob(pattern):
             if path.is_file():
                 path.unlink()
@@ -204,6 +241,35 @@ def load_eval_metrics() -> Dict[str, float]:
         "rmse": float(overall["RMSE"]),
         "psnr": float(overall["PSNR"]),
         "cosine": float(overall["Cosine Similarity"]),
+    }
+
+
+def load_approx_stats() -> Dict[str, float]:
+    stats_path = SAMPLE_OUTPUT_DIR / "approx_stats.json"
+    if not stats_path.exists():
+        return {
+            "total_steps": 0,
+            "pade_steps": 0,
+            "taylor_steps": 0,
+            "mixed_steps": 0,
+            "pade_calls": 0,
+            "taylor_calls": 0,
+            "pade_step_ratio": 0.0,
+            "pade_call_ratio": 0.0,
+        }
+
+    with stats_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    return {
+        "total_steps": int(payload.get("total_steps", 0)),
+        "pade_steps": int(payload.get("pade_steps", 0)),
+        "taylor_steps": int(payload.get("taylor_steps", 0)),
+        "mixed_steps": int(payload.get("mixed_steps", 0)),
+        "pade_calls": int(payload.get("pade_calls", 0)),
+        "taylor_calls": int(payload.get("taylor_calls", 0)),
+        "pade_step_ratio": float(payload.get("pade_step_ratio", 0.0)),
+        "pade_call_ratio": float(payload.get("pade_call_ratio", 0.0)),
     }
 
 
@@ -280,6 +346,9 @@ def archive_run(
         source = SAMPLE_OUTPUT_DIR / filename
         if source.exists():
             shutil.copy2(source, run_dir / filename)
+    approx_stats = SAMPLE_OUTPUT_DIR / "approx_stats.json"
+    if approx_stats.exists():
+        shutil.copy2(approx_stats, run_dir / "approx_stats.json")
 
     if config.archive_images:
         image_dir = run_dir / "images"
@@ -302,6 +371,8 @@ def build_sample_command(config: ExperimentConfig) -> List[str]:
         str(config.max_order),
         "--interval",
         str(config.interval),
+        "--pade-denom-threshold",
+        str(config.pade_denom_threshold),
         "--total-images",
         str(config.total_images),
         "--batch-size",
@@ -315,6 +386,12 @@ def build_sample_command(config: ExperimentConfig) -> List[str]:
     ]
     if config.enable_pade:
         command.append("--enable-pade")
+    else:
+        command.append("--no-enable-pade")
+    if config.pade_only_single_step:
+        command.append("--pade-only-single-step")
+    else:
+        command.append("--no-pade-only-single-step")
     return command
 
 
@@ -347,6 +424,16 @@ def summary_lines(summary: Dict[str, object]) -> List[str]:
         "pade_n",
         "max_order",
         "interval",
+        "pade_only_single_step",
+        "pade_denom_threshold",
+        "approx_total_steps",
+        "pade_steps",
+        "taylor_steps",
+        "mixed_steps",
+        "pade_calls",
+        "taylor_calls",
+        "pade_step_ratio",
+        "pade_call_ratio",
         "artifact_dir",
         "description",
     ]
@@ -387,6 +474,7 @@ def main() -> int:
             label="evaluation",
         )
         metrics = load_eval_metrics()
+        approx_stats = load_approx_stats()
         total_seconds = time.time() - total_start
         status = choose_status(metrics)
 
@@ -405,6 +493,16 @@ def main() -> int:
             "pade_n": config.pade_n,
             "max_order": config.max_order,
             "interval": config.interval,
+            "pade_only_single_step": config.pade_only_single_step,
+            "pade_denom_threshold": config.pade_denom_threshold,
+            "approx_total_steps": approx_stats["total_steps"],
+            "pade_steps": approx_stats["pade_steps"],
+            "taylor_steps": approx_stats["taylor_steps"],
+            "mixed_steps": approx_stats["mixed_steps"],
+            "pade_calls": approx_stats["pade_calls"],
+            "taylor_calls": approx_stats["taylor_calls"],
+            "pade_step_ratio": approx_stats["pade_step_ratio"],
+            "pade_call_ratio": approx_stats["pade_call_ratio"],
             "artifact_dir": "",
             "description": config.description,
         }
@@ -419,12 +517,22 @@ def main() -> int:
                 "pade_n": config.pade_n,
                 "max_order": config.max_order,
                 "interval": config.interval,
+                "pade_only_single_step": str(config.pade_only_single_step).lower(),
+                "pade_denom_threshold": f"{config.pade_denom_threshold:.6g}",
                 "lpips": f"{metrics['lpips']:.6f}",
                 "relative_l1": f"{metrics['relative_l1']:.6f}",
                 "ssim": f"{metrics['ssim']:.6f}",
                 "rmse": f"{metrics['rmse']:.6f}",
                 "psnr": f"{metrics['psnr']:.6f}",
                 "cosine": f"{metrics['cosine']:.6f}",
+                "approx_total_steps": str(approx_stats["total_steps"]),
+                "pade_steps": str(approx_stats["pade_steps"]),
+                "taylor_steps": str(approx_stats["taylor_steps"]),
+                "mixed_steps": str(approx_stats["mixed_steps"]),
+                "pade_calls": str(approx_stats["pade_calls"]),
+                "taylor_calls": str(approx_stats["taylor_calls"]),
+                "pade_step_ratio": f"{approx_stats['pade_step_ratio']:.6f}",
+                "pade_call_ratio": f"{approx_stats['pade_call_ratio']:.6f}",
                 "status": status,
                 "description": config.description,
                 "sample_seconds": f"{sample_seconds:.3f}",
@@ -451,12 +559,22 @@ def main() -> int:
                 "pade_n": config.pade_n,
                 "max_order": config.max_order,
                 "interval": config.interval,
+                "pade_only_single_step": str(config.pade_only_single_step).lower(),
+                "pade_denom_threshold": f"{config.pade_denom_threshold:.6g}",
                 "lpips": "0.000000",
                 "relative_l1": "0.000000",
                 "ssim": "0.000000",
                 "rmse": "0.000000",
                 "psnr": "0.000000",
                 "cosine": "0.000000",
+                "approx_total_steps": "0",
+                "pade_steps": "0",
+                "taylor_steps": "0",
+                "mixed_steps": "0",
+                "pade_calls": "0",
+                "taylor_calls": "0",
+                "pade_step_ratio": "0.000000",
+                "pade_call_ratio": "0.000000",
                 "status": "crash",
                 "description": f"{config.description} | {error_text}"[:200],
                 "sample_seconds": "0.000",
