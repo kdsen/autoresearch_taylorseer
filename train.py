@@ -71,9 +71,9 @@ METRIC_TOLERANCE = 1e-6
 @dataclass
 class ExperimentConfig:
     # Edit this block between experiments.
-    description: str = "retry [2/2] pade 100img"
-    pade_m: int = 2
-    pade_n: int = 2
+    description: str = "candidate [1/3] pade 100img"
+    pade_m: int = 1
+    pade_n: int = 3
     max_order: int = 4
     interval: int = 4
     enable_pade: bool = True
