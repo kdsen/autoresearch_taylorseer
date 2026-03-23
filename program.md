@@ -1,114 +1,291 @@
-# autoresearch
+# autoresearch for TaylorSeer Padé code optimization
 
-This is an experiment to have the LLM do its own research.
+This repo is being used as an autonomous research harness for TaylorSeer-DiT.
+
+The experiment entrypoint is `train.py` in this repo, but it does not train a language model anymore. It runs one TaylorSeer Padé experiment end to end:
+
+1. clears old generated samples
+2. runs `/home/yjs/TaylorSeer/TaylorSeer-DiT/sample.py`
+3. runs `/home/yjs/eval_image_diff.py`
+4. reads the metrics
+5. appends one row to `results.tsv`
+6. writes run artifacts under `runs/`
+
+## In-scope files
+
+Read these files first:
+
+- `README.md`
+- `program.md`
+- `train.py`
+
+Primary code under optimization:
+
+- `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py`
+
+You may inspect these external files as needed:
+
+- `/home/yjs/TaylorSeer/TaylorSeer-DiT/sample.py`
+- `/home/yjs/TaylorSeer/TaylorSeer-DiT/sample_ddp.py`
+- `/home/yjs/eval_image_diff.py`
+
+## Objective
+
+Improve TaylorSeer-DiT sampling quality by iteratively editing the Padé implementation itself.
+Do not treat Padé runtime parameters as the active search space for now.
+
+The runtime configuration is fixed to the following baseline taken from run `20260319-234247`:
+
+- `pade_m=1`
+- `pade_n=2`
+- `max_order=3`
+- `interval=4`
+- `pade_only_single_step=True`
+- `pade_denom_threshold=1e-3`
+- `total_images=100`
+
+The intended operating mode is an indefinitely running agent-driven search loop that continues until manually interrupted.
+The agent must remain the decision-maker for candidate selection throughout the search.
+
+Primary search surface:
+
+- gating logic in `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py`
+- Padé coefficient construction
+- denominator stabilization
+- fallback and blending behavior
+- order-selection logic
+- numerical guards
+
+Prefer small, defensible code changes. Do not randomly thrash across unrelated ideas.
+
+## Non-Negotiable Constraints
+
+These rules are strict. Follow them unless the human explicitly overrides them.
+
+1. Keep the search loop agent-driven.
+   - Do not delegate search control to `pade_search_loop.py` or any other loop-controller, supervisor, planner, driver, or search-runner script.
+   - Do not create a durable local controller that chooses candidates without the agent.
+   - The agent must inspect disk state, choose the next candidate, and decide each iteration itself.
+2. Keep `train.py` as the single-run experiment entrypoint unless there is a clear technical reason to change it.
+   - Avoid redesigning the framework.
+   - Use `train.py` to execute one run under the fixed runtime configuration.
+   - Do not move the search policy into code.
+3. Recover state from disk, not from chat memory.
+   - At the start of every iteration, re-read `results.tsv`.
+   - Inspect the latest run directory under `runs/`.
+   - Prefer `train_summary.json`, `eval_metrics.json`, `approx_stats.json`, and `pade_target_snapshot.py` over long logs.
+4. Keep running until manually interrupted.
+   - Do not ask whether to continue.
+   - Do not ask whether to apply the next Padé code change.
+   - Treat Padé implementation edits and description-only metadata changes as pre-authorized by this program.
+   - Do not stop just because one local code idea fails.
+   - If a run crashes, diagnose it, log it through the normal flow, and continue.
+   - A per-run report is only a heartbeat, not a handoff point.
+   - Do not return a final answer just because one run completed.
+5. Prefer foreground execution.
+   - Prefer a foreground PTY session that the agent can actively monitor and continue from in the same turn.
+   - Do not intentionally daemonize, detach, `nohup`, or otherwise hand off the loop to a background controller.
+   - If the environment stops the agent despite these instructions, recover from disk on the next start rather than replacing the workflow with a local controller.
+6. Do not delete existing runs or results.
+7. Do not revert unrelated local changes.
+8. Keep the runtime parameters fixed.
+   - Do not search over `pade_m`, `pade_n`, `max_order`, `interval`, `pade_only_single_step`, or `pade_denom_threshold`.
+   - Only the human may explicitly re-open parameter search.
+
+## Metric priority
+
+Use this ranking when deciding whether a run is better:
+
+1. lower `LPIPS`
+2. if tied, lower `Relative L1`
+3. if tied, higher `SSIM`
+4. if tied, lower `RMSE`
+
+`train.py` already uses this ordering when marking a successful run as `keep` or `discard`.
 
 ## Setup
 
-To set up a new experiment, work with the user to:
+Before starting the loop:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+1. Create a fresh branch such as `autoresearch/pade-code-<date>`.
+2. Verify these paths exist:
+   - `/home/yjs/xdit_env/bin/python`
+   - `/home/yjs/TaylorSeer/TaylorSeer-DiT/sample.py`
+   - `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py`
+   - `/home/yjs/eval_image_diff.py`
+   - `/home/yjs/baseline_samples`
+3. Verify imports work in `/home/yjs/xdit_env`.
+4. Confirm `results.tsv` exists or let `train.py` create it.
+5. Confirm `runs/` exists or let `train.py` create it.
 
-Once you get confirmation, kick off the experimentation.
+## What to edit
 
-## Experimentation
+Normal candidate iterations should primarily edit `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py`.
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Typical code regions to improve:
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+- `_should_use_pade`
+- `pade_formula_11`
+- `pade_coefficients_from_taylor`
+- `choose_pade_order_by_available_derivatives`
+- `_evaluate_generic_pade`
+- stability guards and blending rules
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+Use `train.py` as the fixed single-run harness.
+Do not redesign the harness unless the human explicitly asks for framework changes.
+Do not use `pade_search_loop.py` or add any new loop-controller or supervisor.
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+## Execution model
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+The command below executes exactly one experiment iteration:
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
-
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
-
-## Output format
-
-Once the script finishes it prints a summary like this:
-
-```
----
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+```bash
+/home/yjs/xdit_env/bin/python train.py > run.log 2>&1
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+That command is intentionally single-run. The indefinite loop is created by the agent reissuing this one-shot command after each completed post-run review.
 
-```
-grep "^val_bpb:" run.log
-```
+Required behavior:
 
-## Logging results
+- Keep the loop alive by repeatedly choosing one code candidate, running the single-run command once, reading the resulting artifacts, and immediately choosing the next candidate.
+- Treat the active agent session as the loop owner. Prefer keeping the workflow alive in a foreground PTY or equivalent actively monitored session.
+- Do not replace this with a shell `while` loop, `nohup`, daemon, background service, cron job, local controller, or search-runner script.
+- Do not reinterpret the single-run command itself as the loop. The loop is the agent's repeated decision-run-review cycle.
+- If the environment interrupts the session or ends the turn, resume by rereading `results.tsv` and the latest run directory from disk, then continue the loop immediately.
+- Do not ask for confirmation before launching the next candidate if the only changes are Padé code edits or description text.
+- Do not wait for user approval after printing a run summary.
+- After each summary, immediately decide the next candidate and launch it in the same turn unless there is an environment blocker.
+- The only valid reasons to stop and ask the human are:
+  1. missing required paths
+  2. import or interpreter failure that blocks all runs
+  3. CUDA or GPU unavailable
+  4. repeated identical crash with no clear local fix
+  5. an explicit human interruption
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+## Baseline
 
-The TSV has a header row and 5 columns:
+The baseline is the fixed runtime config already encoded in `train.py`, corresponding to the settings used in run `20260319-234247`.
 
-```
-commit	val_bpb	memory_gb	status	description
-```
+Launch one iteration with:
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
-
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+```bash
+/home/yjs/xdit_env/bin/python train.py   --description "baseline fixed-parameter Padé code"   > run.log 2>&1
 ```
 
-## The experiment loop
+Read the summary with:
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+```bash
+grep '^status:\|^lpips:\|^relative_l1:\|^ssim:\|^rmse:' run.log
+```
 
-LOOP FOREVER:
+## Loop
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+LOOP FOREVER until the human stops you:
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+1. Re-read `results.tsv` from disk at the start of every loop iteration, and also inspect the latest directory under `runs/` so you recover state from files instead of relying on chat memory.
+2. Keep context usage low:
+   - do not repeatedly read entire large logs or the full `results.tsv` into context unless there is a specific need
+   - prefer compact summaries extracted from files
+   - for `results.tsv`, focus on the current best kept rows, the most recent rows, and any clear code-change trends
+   - for `run.log`, read the final summary first, and only read traceback lines if the run crashed
+   - for detailed metrics and code provenance, prefer the structured files in the latest run directory such as `train_summary.json`, `eval_metrics.json`, `approx_stats.json`, and `pade_target_snapshot.py`
+3. Identify the current best kept implementation.
+4. Choose exactly one next code candidate for the next experiment.
+   - Do not batch-edit multiple independent ideas in advance.
+   - Do not hand this decision to a script.
+5. Update the Padé implementation in `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py`.
+   - Prefer one coherent hypothesis per iteration.
+   - Keep diffs small enough that failures are attributable.
+6. Update `description` in the next run if that helps traceability.
+7. Commit the change when it is useful for traceability.
+8. Run one experiment:
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+```bash
+/home/yjs/xdit_env/bin/python train.py   --description "tighten denominator guard and blend toward Taylor near poles"   > run.log 2>&1
+```
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+9. Read the summary from `run.log`.
+10. If the run crashed, inspect the traceback in `run.log`.
+11. Read the newest row in `results.tsv`.
+12. Read the newest `train_summary.json`.
+13. Read the newest `approx_stats.json`.
+14. Read `pade_code_sha256` and `pade_snapshot_file` from the latest summary when you need to confirm exactly which Padé implementation was evaluated.
+15. Use the result to decide the next code candidate.
+16. Continue immediately within the active agent workflow.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+Do not pause to ask whether to continue.
+Do not pause to ask whether to apply the next candidate's code changes.
+Do not convert the workflow into a local controller just to survive chat-turn boundaries.
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+## Search strategy
+
+Use disciplined local code search.
+
+Suggested order:
+
+1. establish a stable baseline for the current Padé implementation
+2. improve one numerical issue at a time
+3. prefer conservative stability fixes before aggressive higher-order logic
+4. keep the number of moving parts per candidate small
+5. favor changes that improve both quality and robustness over brittle one-off wins
+6. use `pade_step_ratio` and `pade_call_ratio` to verify whether Padé is actually activating
+7. if Padé rarely activates, improve the gate or eligibility logic before drawing strong conclusions about the approximation formula
+8. if Padé activates often but quality worsens, focus on coefficient construction, denominator safety, or blending back toward Taylor
+9. if a candidate crashes due to an obvious implementation issue, fix the implementation and continue; do not abandon the overall loop
+
+## Output
+
+Each run prints a stable summary that starts with `---`.
+
+It includes:
+
+- `status`
+- `pade_target_file`
+- `pade_code_sha256`
+- `pade_snapshot_file`
+- `lpips`
+- `relative_l1`
+- `ssim`
+- `rmse`
+- `psnr`
+- `cosine`
+- `sample_seconds`
+- `eval_seconds`
+- `total_seconds`
+- `pade_m`
+- `pade_n`
+- `max_order`
+- `interval`
+- `pade_only_single_step`
+- `pade_denom_threshold`
+- `approx_total_steps`
+- `pade_steps`
+- `taylor_steps`
+- `mixed_steps`
+- `pade_calls`
+- `taylor_calls`
+- `pade_step_ratio`
+- `pade_call_ratio`
+- `artifact_dir`
+
+`train.py` also appends one row to `results.tsv` automatically.
+
+## Reporting
+
+Keep progress reports concise. For each completed run, include:
+
+- the code candidate just tested
+- the short `pade_code_sha256`
+- `keep`, `discard`, or `crash`
+- key metrics: `lpips`, `relative_l1`, `ssim`, `rmse`
+- `pade_step_ratio`
+- `pade_call_ratio`
+- the next planned code candidate
+
+Immediately after reporting, start the next run unless an allowed blocker from the execution model is present.
+
+## Notes
+
+- `prepare.py` from the original autoresearch project is not part of this task.
+- The original language-model training workflow is not used here.
+- For this repo, `train.py` serves as the single experiment runner, and the agent remains responsible for orchestration.

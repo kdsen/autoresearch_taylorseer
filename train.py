@@ -1,8 +1,9 @@
 """
-Unified experiment entrypoint for TaylorSeer Padé parameter search.
+Unified experiment entrypoint for TaylorSeer Padé code optimization.
 
 This replaces the original autoresearch training script for this local setup.
-Edit the EXPERIMENT block below between runs, then execute:
+The runtime Padé configuration is fixed to the baseline from run 20260319-234247.
+Edit Padé implementation code, then execute:
 
     /home/yjs/xdit_env/bin/python train.py
 """
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import shutil
 import subprocess
@@ -32,6 +34,7 @@ BASELINE_DIR = Path("/home/yjs/baseline_samples")
 SAMPLE_OUTPUT_DIR = TAYLORSEER_DIR / "pade_samples"
 RUNS_DIR = AUTORESEARCH_DIR / "runs"
 RESULTS_TSV = AUTORESEARCH_DIR / "results.tsv"
+PADE_TARGET_FILE = TAYLORSEER_DIR / "taylor_utils" / "__init__.py"
 
 RESULT_FIELDS = [
     "timestamp",
@@ -58,6 +61,9 @@ RESULT_FIELDS = [
     "pade_step_ratio",
     "pade_call_ratio",
     "status",
+    "pade_target_file",
+    "pade_code_sha256",
+    "pade_snapshot_file",
     "description",
     "sample_seconds",
     "eval_seconds",
@@ -70,15 +76,15 @@ METRIC_TOLERANCE = 1e-6
 
 @dataclass
 class ExperimentConfig:
-    # Edit this block between experiments.
-    description: str = "auto relax single-step [1/2] pade 100img"
+    # Keep this runtime configuration fixed while optimizing Padé code.
+    description: str = "fixed-parameter Padé code baseline"
     pade_m: int = 1
     pade_n: int = 2
     max_order: int = 3
     interval: int = 4
     enable_pade: bool = True
-    pade_only_single_step: bool = False
-    pade_denom_threshold: float = 0.0001
+    pade_only_single_step: bool = True
+    pade_denom_threshold: float = 0.001
     total_images: int = 100
     batch_size: int = 2
     seed: int = 42
@@ -94,11 +100,6 @@ EXPERIMENT = ExperimentConfig()
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--description", type=str, default=None)
-    parser.add_argument("--pade-m", type=int, default=None)
-    parser.add_argument("--pade-n", type=int, default=None)
-    parser.add_argument("--max-order", type=int, default=None)
-    parser.add_argument("--interval", type=int, default=None)
-    parser.add_argument("--pade-denom-threshold", type=float, default=None)
     parser.add_argument("--total-images", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -106,16 +107,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-sampling-steps", type=int, default=None)
     parser.add_argument("--timeout-seconds", type=int, default=None)
     parser.add_argument(
-        "--pade-only-single-step",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
         "--archive-images",
         action=argparse.BooleanOptionalAction,
         default=None,
     )
-    parser.add_argument("--disable-pade", action="store_true")
     return parser.parse_args()
 
 
@@ -123,11 +118,6 @@ def merge_config(args: argparse.Namespace) -> ExperimentConfig:
     config = ExperimentConfig(**EXPERIMENT.__dict__)
     for arg_name, field_name in [
         ("description", "description"),
-        ("pade_m", "pade_m"),
-        ("pade_n", "pade_n"),
-        ("max_order", "max_order"),
-        ("interval", "interval"),
-        ("pade_denom_threshold", "pade_denom_threshold"),
         ("total_images", "total_images"),
         ("batch_size", "batch_size"),
         ("seed", "seed"),
@@ -139,12 +129,8 @@ def merge_config(args: argparse.Namespace) -> ExperimentConfig:
         if value is not None:
             setattr(config, field_name, value)
 
-    if args.pade_only_single_step is not None:
-        config.pade_only_single_step = args.pade_only_single_step
     if args.archive_images is not None:
         config.archive_images = args.archive_images
-    if args.disable_pade:
-        config.enable_pade = False
 
     if config.pade_m < 1 or config.pade_n < 1:
         raise ValueError("pade_m and pade_n must both be >= 1")
@@ -166,6 +152,7 @@ def ensure_paths_exist() -> None:
         EVAL_SCRIPT,
         BASELINE_DIR,
         TAYLORSEER_DIR,
+        PADE_TARGET_FILE,
     ]
     missing = [str(path) for path in required_paths if not path.exists()]
     if missing:
@@ -330,15 +317,29 @@ def append_result(row: Dict[str, object]) -> None:
         writer.writerow(row)
 
 
+def inspect_pade_target() -> Dict[str, object]:
+    source_bytes = PADE_TARGET_FILE.read_bytes()
+    return {
+        "pade_target_file": str(PADE_TARGET_FILE),
+        "pade_code_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "source_bytes": source_bytes,
+    }
+
+
 def archive_run(
     config: ExperimentConfig,
     timestamp: str,
     summary: Dict[str, object],
+    pade_target: Dict[str, object],
 ) -> Path:
     run_dir = RUNS_DIR / f"{timestamp}-m{config.pade_m}-n{config.pade_n}-k{config.max_order}-i{config.interval}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    snapshot_path = run_dir / "pade_target_snapshot.py"
+    snapshot_path.write_bytes(pade_target["source_bytes"])
+
     summary["artifact_dir"] = str(run_dir)
+    summary["pade_snapshot_file"] = str(snapshot_path)
     with (run_dir / "train_summary.json").open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 
@@ -411,6 +412,9 @@ def build_eval_command() -> List[str]:
 def summary_lines(summary: Dict[str, object]) -> List[str]:
     ordered_keys = [
         "status",
+        "pade_target_file",
+        "pade_code_sha256",
+        "pade_snapshot_file",
         "lpips",
         "relative_l1",
         "ssim",
@@ -458,6 +462,7 @@ def main() -> int:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     commit = git_value("rev-parse", "--short", "HEAD")
     branch = git_value("branch", "--show-current")
+    pade_target = inspect_pade_target()
     total_start = time.time()
 
     try:
@@ -480,6 +485,9 @@ def main() -> int:
 
         summary: Dict[str, object] = {
             "status": status,
+            "pade_target_file": pade_target["pade_target_file"],
+            "pade_code_sha256": pade_target["pade_code_sha256"],
+            "pade_snapshot_file": "",
             "lpips": metrics["lpips"],
             "relative_l1": metrics["relative_l1"],
             "ssim": metrics["ssim"],
@@ -506,7 +514,7 @@ def main() -> int:
             "artifact_dir": "",
             "description": config.description,
         }
-        artifact_dir = archive_run(config, timestamp, summary)
+        artifact_dir = archive_run(config, timestamp, summary, pade_target)
 
         append_result(
             {
@@ -534,6 +542,9 @@ def main() -> int:
                 "pade_step_ratio": f"{approx_stats['pade_step_ratio']:.6f}",
                 "pade_call_ratio": f"{approx_stats['pade_call_ratio']:.6f}",
                 "status": status,
+                "pade_target_file": pade_target["pade_target_file"],
+                "pade_code_sha256": pade_target["pade_code_sha256"],
+                "pade_snapshot_file": str(artifact_dir / "pade_target_snapshot.py"),
                 "description": config.description,
                 "sample_seconds": f"{sample_seconds:.3f}",
                 "eval_seconds": f"{eval_seconds:.3f}",
@@ -576,6 +587,9 @@ def main() -> int:
                 "pade_step_ratio": "0.000000",
                 "pade_call_ratio": "0.000000",
                 "status": "crash",
+                "pade_target_file": pade_target["pade_target_file"],
+                "pade_code_sha256": pade_target["pade_code_sha256"],
+                "pade_snapshot_file": "",
                 "description": f"{config.description} | {error_text}"[:200],
                 "sample_seconds": "0.000",
                 "eval_seconds": "0.000",
@@ -585,6 +599,8 @@ def main() -> int:
         )
         print("---", flush=True)
         print("status: crash", flush=True)
+        print(f"pade_target_file: {pade_target['pade_target_file']}", flush=True)
+        print(f"pade_code_sha256: {pade_target['pade_code_sha256']}", flush=True)
         print(f"error: {error_text}", flush=True)
         print(f"pade_m: {config.pade_m}", flush=True)
         print(f"pade_n: {config.pade_n}", flush=True)
