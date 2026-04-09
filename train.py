@@ -1,9 +1,9 @@
 """
-Unified experiment entrypoint for TaylorSeer Padé code optimization.
+Unified experiment entrypoint for TaylorSeer approximation-family optimization.
 
 This replaces the original autoresearch training script for this local setup.
-The runtime Padé evaluation bucket is fixed to the interval-3 standing-baseline setup.
-Edit Padé implementation code, then execute:
+The runtime evaluation bucket is fixed to the interval-3 standing-baseline setup.
+Edit the approximation hook in `taylor_utils/__init__.py`, then execute:
 
     /home/yjs/xdit_env/bin/python train.py
 """
@@ -80,6 +80,11 @@ RESULT_FIELDS = [
     "paired_delta_relative_l1",
     "paired_delta_ssim",
     "paired_delta_rmse",
+    "latency_baseline_timestamp",
+    "latency_baseline_sample_seconds",
+    "sample_seconds_budget",
+    "sample_seconds_ratio",
+    "latency_within_budget",
     "pade_target_file",
     "pade_code_sha256",
     "pade_snapshot_file",
@@ -92,13 +97,15 @@ RESULT_FIELDS = [
 
 METRIC_TOLERANCE = 1e-6
 STANDING_CONTROL_TIMESTAMP = "20260329-171615"
+LATENCY_BUDGET_RATIO = 1.05
 
 
 @dataclass
 class ExperimentConfig:
     # Freeze runtime parameters at the interval-3 evaluation anchor.
-    # The current phase allows two Padé order choices: [1/2] and [2/1].
-    description: str = "standing-baseline Padé code eval at interval 3"
+    # The search surface is the approximation-family implementation behind
+    # pade_formula_mn(), not the runtime parameters themselves.
+    description: str = "standing-baseline approximation-family search at interval 3"
     pade_m: int = 1
     pade_n: int = 2
     max_order: int = 3
@@ -430,6 +437,10 @@ def row_metrics(row: Dict[str, str]) -> Dict[str, float]:
     }
 
 
+def row_sample_seconds(row: Dict[str, str]) -> float:
+    return float(row["sample_seconds"])
+
+
 def _best_row(rows: Iterable[Dict[str, str]]) -> Optional[Dict[str, str]]:
     row_list = list(rows)
     if not row_list:
@@ -466,6 +477,7 @@ def better_than(current: Dict[str, float], previous: Dict[str, float]) -> bool:
 def paired_control_summary(
     config: ExperimentConfig,
     metrics: Dict[str, float],
+    sample_seconds: float,
     pade_code_sha256: str,
 ) -> Dict[str, object]:
     default_summary: Dict[str, object] = {
@@ -480,6 +492,11 @@ def paired_control_summary(
         "paired_delta_relative_l1": "",
         "paired_delta_ssim": "",
         "paired_delta_rmse": "",
+        "latency_baseline_timestamp": "",
+        "latency_baseline_sample_seconds": "",
+        "sample_seconds_budget": "",
+        "sample_seconds_ratio": "",
+        "latency_within_budget": "",
     }
 
     candidate_rows = [
@@ -513,6 +530,10 @@ def paired_control_summary(
         return default_summary
 
     control_metrics = row_metrics(best_control)
+    control_sample_seconds = row_sample_seconds(best_control)
+    sample_seconds_budget = control_sample_seconds * LATENCY_BUDGET_RATIO
+    latency_within_budget = sample_seconds <= sample_seconds_budget
+
     if better_than(metrics, control_metrics):
         paired_outcome = "better_than_paired_control"
     elif better_than(control_metrics, metrics):
@@ -532,15 +553,21 @@ def paired_control_summary(
         "paired_delta_relative_l1": metrics["relative_l1"] - control_metrics["relative_l1"],
         "paired_delta_ssim": metrics["ssim"] - control_metrics["ssim"],
         "paired_delta_rmse": metrics["rmse"] - control_metrics["rmse"],
+        "latency_baseline_timestamp": best_control.get("timestamp", ""),
+        "latency_baseline_sample_seconds": control_sample_seconds,
+        "sample_seconds_budget": sample_seconds_budget,
+        "sample_seconds_ratio": sample_seconds / control_sample_seconds,
+        "latency_within_budget": latency_within_budget,
     }
 
 
 def choose_status(
     config: ExperimentConfig,
     metrics: Dict[str, float],
+    sample_seconds: float,
     pade_code_sha256: str,
 ) -> Dict[str, object]:
-    paired = paired_control_summary(config, metrics, pade_code_sha256)
+    paired = paired_control_summary(config, metrics, sample_seconds, pade_code_sha256)
     same_mode_rows = [
         row
         for row in previous_completed_rows()
@@ -550,14 +577,21 @@ def choose_status(
     is_mode_best = best_same_mode is None or better_than(metrics, row_metrics(best_same_mode))
 
     if config.enable_pade:
-        if paired["paired_outcome"] == "better_than_paired_control":
-            status = "pade_beats_control"
+        latency_ok = paired["latency_within_budget"] is True
+        if paired["paired_outcome"] == "better_than_paired_control" and latency_ok:
+            status = "family_beats_baseline_within_latency_budget"
+        elif paired["paired_outcome"] == "better_than_paired_control":
+            status = "family_beats_baseline_but_too_slow"
+        elif paired["paired_outcome"] == "tied_paired_control" and latency_ok:
+            status = "family_ties_baseline_within_latency_budget"
         elif paired["paired_outcome"] == "tied_paired_control":
-            status = "pade_ties_control"
+            status = "family_ties_baseline_but_too_slow"
+        elif paired["paired_outcome"] == "worse_than_paired_control" and latency_ok:
+            status = "family_within_latency_budget_but_loses_baseline"
         elif paired["paired_outcome"] == "worse_than_paired_control":
-            status = "pade_loses_to_control"
+            status = "family_loses_baseline_and_is_too_slow"
         else:
-            status = "pade_no_control_baseline"
+            status = "family_no_baseline"
     else:
         status = "control_reference" if is_mode_best else "control_not_best_in_bucket"
 
@@ -682,6 +716,11 @@ def summary_lines(summary: Dict[str, object]) -> List[str]:
         "sample_seconds",
         "eval_seconds",
         "total_seconds",
+        "latency_baseline_timestamp",
+        "latency_baseline_sample_seconds",
+        "sample_seconds_budget",
+        "sample_seconds_ratio",
+        "latency_within_budget",
         "pade_m",
         "pade_n",
         "max_order",
@@ -756,7 +795,12 @@ def main() -> int:
         metrics = load_eval_metrics()
         approx_stats = load_approx_stats()
         total_seconds = time.time() - total_start
-        status_info = choose_status(config, metrics, pade_target["pade_code_sha256"])
+        status_info = choose_status(
+            config,
+            metrics,
+            sample_seconds,
+            pade_target["pade_code_sha256"],
+        )
 
         summary: Dict[str, object] = {
             "status": status_info["status"],
@@ -774,6 +818,11 @@ def main() -> int:
             "sample_seconds": sample_seconds,
             "eval_seconds": eval_seconds,
             "total_seconds": total_seconds,
+            "latency_baseline_timestamp": status_info["latency_baseline_timestamp"],
+            "latency_baseline_sample_seconds": status_info["latency_baseline_sample_seconds"],
+            "sample_seconds_budget": status_info["sample_seconds_budget"],
+            "sample_seconds_ratio": status_info["sample_seconds_ratio"],
+            "latency_within_budget": status_info["latency_within_budget"],
             "pade_m": config.pade_m,
             "pade_n": config.pade_n,
             "max_order": config.max_order,
@@ -887,6 +936,27 @@ def main() -> int:
                     if status_info["paired_delta_rmse"] != ""
                     else ""
                 ),
+                "latency_baseline_timestamp": status_info["latency_baseline_timestamp"],
+                "latency_baseline_sample_seconds": (
+                    f"{status_info['latency_baseline_sample_seconds']:.3f}"
+                    if status_info["latency_baseline_sample_seconds"] != ""
+                    else ""
+                ),
+                "sample_seconds_budget": (
+                    f"{status_info['sample_seconds_budget']:.3f}"
+                    if status_info["sample_seconds_budget"] != ""
+                    else ""
+                ),
+                "sample_seconds_ratio": (
+                    f"{status_info['sample_seconds_ratio']:.6f}"
+                    if status_info["sample_seconds_ratio"] != ""
+                    else ""
+                ),
+                "latency_within_budget": (
+                    str(status_info["latency_within_budget"]).lower()
+                    if status_info["latency_within_budget"] != ""
+                    else ""
+                ),
                 "pade_target_file": pade_target["pade_target_file"],
                 "pade_code_sha256": pade_target["pade_code_sha256"],
                 "pade_snapshot_file": str(artifact_dir / "pade_target_snapshot.py"),
@@ -951,6 +1021,11 @@ def main() -> int:
                 "paired_delta_relative_l1": "",
                 "paired_delta_ssim": "",
                 "paired_delta_rmse": "",
+                "latency_baseline_timestamp": "",
+                "latency_baseline_sample_seconds": "",
+                "sample_seconds_budget": "",
+                "sample_seconds_ratio": "",
+                "latency_within_budget": "",
                 "pade_target_file": pade_target["pade_target_file"],
                 "pade_code_sha256": pade_target["pade_code_sha256"],
                 "pade_snapshot_file": "",
