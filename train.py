@@ -2,7 +2,7 @@
 Unified experiment entrypoint for TaylorSeer Padé code optimization.
 
 This replaces the original autoresearch training script for this local setup.
-The runtime Padé configuration is fixed to the baseline from run 20260319-234247.
+The runtime Padé evaluation bucket is fixed to the interval-3 standing-baseline setup.
 Edit Padé implementation code, then execute:
 
     /home/yjs/xdit_env/bin/python train.py
@@ -44,8 +44,14 @@ RESULT_FIELDS = [
     "pade_n",
     "max_order",
     "interval",
+    "enable_pade",
     "pade_only_single_step",
     "pade_denom_threshold",
+    "total_images",
+    "batch_size",
+    "seed",
+    "cfg_scale",
+    "num_sampling_steps",
     "lpips",
     "relative_l1",
     "ssim",
@@ -61,6 +67,19 @@ RESULT_FIELDS = [
     "pade_step_ratio",
     "pade_call_ratio",
     "status",
+    "comparison_bucket",
+    "bucket_best",
+    "paired_control_scope",
+    "paired_control_timestamp",
+    "paired_outcome",
+    "paired_control_lpips",
+    "paired_control_relative_l1",
+    "paired_control_ssim",
+    "paired_control_rmse",
+    "paired_delta_lpips",
+    "paired_delta_relative_l1",
+    "paired_delta_ssim",
+    "paired_delta_rmse",
     "pade_target_file",
     "pade_code_sha256",
     "pade_snapshot_file",
@@ -72,16 +91,18 @@ RESULT_FIELDS = [
 ]
 
 METRIC_TOLERANCE = 1e-6
+STANDING_CONTROL_TIMESTAMP = "20260329-171615"
 
 
 @dataclass
 class ExperimentConfig:
-    # Keep this runtime configuration fixed while optimizing Padé code.
-    description: str = "fixed-parameter Padé code baseline"
+    # Freeze runtime parameters at the interval-3 evaluation anchor.
+    # The current phase allows two Padé order choices: [1/2] and [2/1].
+    description: str = "standing-baseline Padé code eval at interval 3"
     pade_m: int = 1
     pade_n: int = 2
     max_order: int = 3
-    interval: int = 4
+    interval: int = 3
     enable_pade: bool = True
     pade_only_single_step: bool = True
     pade_denom_threshold: float = 0.001
@@ -95,11 +116,53 @@ class ExperimentConfig:
 
 
 EXPERIMENT = ExperimentConfig()
+DEFAULT_CONFIG = ExperimentConfig()
+BOOL_FIELDS = {"enable_pade", "pade_only_single_step"}
+INT_FIELDS = {
+    "pade_m",
+    "pade_n",
+    "max_order",
+    "interval",
+    "total_images",
+    "batch_size",
+    "seed",
+    "num_sampling_steps",
+}
+FLOAT_FIELDS = {"pade_denom_threshold", "cfg_scale"}
+COMPARISON_FIELDS = [
+    "pade_m",
+    "pade_n",
+    "max_order",
+    "interval",
+    "pade_only_single_step",
+    "pade_denom_threshold",
+    "total_images",
+    "batch_size",
+    "seed",
+    "cfg_scale",
+    "num_sampling_steps",
+]
+CONTROL_BASELINE_FIELDS = [
+    "max_order",
+    "interval",
+    "total_images",
+    "batch_size",
+    "seed",
+    "cfg_scale",
+    "num_sampling_steps",
+]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--description", type=str, default=None)
+    parser.add_argument("--pade-m", type=int, default=None)
+    parser.add_argument("--pade-n", type=int, default=None)
+    parser.add_argument(
+        "--enable-pade",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--total-images", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -118,6 +181,9 @@ def merge_config(args: argparse.Namespace) -> ExperimentConfig:
     config = ExperimentConfig(**EXPERIMENT.__dict__)
     for arg_name, field_name in [
         ("description", "description"),
+        ("pade_m", "pade_m"),
+        ("pade_n", "pade_n"),
+        ("enable_pade", "enable_pade"),
         ("total_images", "total_images"),
         ("batch_size", "batch_size"),
         ("seed", "seed"),
@@ -134,6 +200,8 @@ def merge_config(args: argparse.Namespace) -> ExperimentConfig:
 
     if config.pade_m < 1 or config.pade_n < 1:
         raise ValueError("pade_m and pade_n must both be >= 1")
+    if (config.pade_m, config.pade_n) not in {(1, 2), (2, 1)}:
+        raise ValueError("current phase only allows Padé orders [1/2] or [2/1]")
     if config.max_order < (config.pade_m + config.pade_n):
         raise ValueError(
             f"max_order={config.max_order} must be at least pade_m + pade_n = "
@@ -260,12 +328,121 @@ def load_approx_stats() -> Dict[str, float]:
     }
 
 
-def previous_success_rows() -> Iterable[Dict[str, str]]:
+def _format_bool(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value).strip().lower()
+
+
+def _format_bucket_value(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return str(value)
+
+
+def _infer_enable_pade_from_legacy_row(row: Dict[str, str]) -> bool:
+    explicit = row.get("enable_pade", "")
+    if explicit:
+        return _format_bool(explicit) == "true"
+
+    pade_calls = row.get("pade_calls", "")
+    taylor_calls = row.get("taylor_calls", "")
+    if pade_calls and taylor_calls:
+        try:
+            if int(pade_calls) == 0 and int(taylor_calls) > 0:
+                return False
+        except ValueError:
+            pass
+
+    description = row.get("description", "").lower()
+    if "pure taylor" in description:
+        return False
+
+    return True
+
+
+def _row_field_value(row: Dict[str, str], field_name: str) -> object:
+    if field_name == "enable_pade":
+        return _infer_enable_pade_from_legacy_row(row)
+
+    raw_value = row.get(field_name, "")
+    if raw_value == "":
+        return getattr(DEFAULT_CONFIG, field_name)
+
+    if field_name in BOOL_FIELDS:
+        return _format_bool(raw_value) == "true"
+    if field_name in INT_FIELDS:
+        return int(raw_value)
+    if field_name in FLOAT_FIELDS:
+        return float(raw_value)
+    return raw_value
+
+
+def _config_field_value(config: ExperimentConfig, field_name: str) -> object:
+    return getattr(config, field_name)
+
+
+def _comparison_bucket(config: ExperimentConfig) -> str:
+    return ",".join(
+        f"{field_name}={_format_bucket_value(_config_field_value(config, field_name))}"
+        for field_name in COMPARISON_FIELDS
+    )
+
+
+def _row_matches_bucket(
+    row: Dict[str, str],
+    config: ExperimentConfig,
+    *,
+    include_enable_pade: bool,
+) -> bool:
+    fields = list(COMPARISON_FIELDS)
+    if include_enable_pade:
+        fields.append("enable_pade")
+    return all(
+        _row_field_value(row, field_name) == _config_field_value(config, field_name)
+        for field_name in fields
+    )
+
+
+def _row_matches_control_baseline(row: Dict[str, str], config: ExperimentConfig) -> bool:
+    return all(
+        _row_field_value(row, field_name) == _config_field_value(config, field_name)
+        for field_name in CONTROL_BASELINE_FIELDS
+    )
+
+
+def previous_completed_rows() -> Iterable[Dict[str, str]]:
     if not RESULTS_TSV.exists():
         return []
     with RESULTS_TSV.open("r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle, delimiter="\t")
-        return [row for row in reader if row.get("status") == "keep"]
+        return [row for row in reader if row.get("status") != "crash"]
+
+
+def row_metrics(row: Dict[str, str]) -> Dict[str, float]:
+    return {
+        "lpips": float(row["lpips"]),
+        "relative_l1": float(row["relative_l1"]),
+        "ssim": float(row["ssim"]),
+        "rmse": float(row["rmse"]),
+    }
+
+
+def _best_row(rows: Iterable[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    row_list = list(rows)
+    if not row_list:
+        return None
+    return min(
+        row_list,
+        key=lambda row: (
+            float(row["lpips"]),
+            float(row["relative_l1"]),
+            -float(row["ssim"]),
+            float(row["rmse"]),
+        ),
+    )
 
 
 def better_than(current: Dict[str, float], previous: Dict[str, float]) -> bool:
@@ -286,29 +463,108 @@ def better_than(current: Dict[str, float], previous: Dict[str, float]) -> bool:
     return False
 
 
-def choose_status(metrics: Dict[str, float]) -> str:
-    best_rows = list(previous_success_rows())
-    if not best_rows:
-        return "keep"
+def paired_control_summary(
+    config: ExperimentConfig,
+    metrics: Dict[str, float],
+    pade_code_sha256: str,
+) -> Dict[str, object]:
+    default_summary: Dict[str, object] = {
+        "paired_control_scope": "none",
+        "paired_control_timestamp": "",
+        "paired_outcome": "unpaired",
+        "paired_control_lpips": "",
+        "paired_control_relative_l1": "",
+        "paired_control_ssim": "",
+        "paired_control_rmse": "",
+        "paired_delta_lpips": "",
+        "paired_delta_relative_l1": "",
+        "paired_delta_ssim": "",
+        "paired_delta_rmse": "",
+    }
 
-    def row_metrics(row: Dict[str, str]) -> Dict[str, float]:
-        return {
-            "lpips": float(row["lpips"]),
-            "relative_l1": float(row["relative_l1"]),
-            "ssim": float(row["ssim"]),
-            "rmse": float(row["rmse"]),
-        }
+    candidate_rows = [
+        row
+        for row in previous_completed_rows()
+        if _row_matches_control_baseline(row, config)
+        and not _row_field_value(row, "enable_pade")
+    ]
+    best_control = None
+    control_scope = "none"
+    same_code_controls = [
+        row for row in candidate_rows if row.get("pade_code_sha256", "") == pade_code_sha256
+    ]
+    if same_code_controls:
+        best_control = max(same_code_controls, key=lambda row: row.get("timestamp", ""))
+        control_scope = "same_code_pure_taylor"
+    else:
+        standing_controls = [
+            row
+            for row in candidate_rows
+            if row.get("timestamp", "") == STANDING_CONTROL_TIMESTAMP
+        ]
+        if standing_controls:
+            best_control = standing_controls[0]
+            control_scope = "standing_pure_taylor"
+        elif candidate_rows:
+            best_control = _best_row(candidate_rows)
+            control_scope = "fallback_pure_taylor"
 
-    best_previous = min(
-        best_rows,
-        key=lambda row: (
-            float(row["lpips"]),
-            float(row["relative_l1"]),
-            -float(row["ssim"]),
-            float(row["rmse"]),
-        ),
-    )
-    return "keep" if better_than(metrics, row_metrics(best_previous)) else "discard"
+    if best_control is None:
+        return default_summary
+
+    control_metrics = row_metrics(best_control)
+    if better_than(metrics, control_metrics):
+        paired_outcome = "better_than_paired_control"
+    elif better_than(control_metrics, metrics):
+        paired_outcome = "worse_than_paired_control"
+    else:
+        paired_outcome = "tied_paired_control"
+
+    return {
+        "paired_control_scope": control_scope,
+        "paired_control_timestamp": best_control.get("timestamp", ""),
+        "paired_outcome": paired_outcome,
+        "paired_control_lpips": control_metrics["lpips"],
+        "paired_control_relative_l1": control_metrics["relative_l1"],
+        "paired_control_ssim": control_metrics["ssim"],
+        "paired_control_rmse": control_metrics["rmse"],
+        "paired_delta_lpips": metrics["lpips"] - control_metrics["lpips"],
+        "paired_delta_relative_l1": metrics["relative_l1"] - control_metrics["relative_l1"],
+        "paired_delta_ssim": metrics["ssim"] - control_metrics["ssim"],
+        "paired_delta_rmse": metrics["rmse"] - control_metrics["rmse"],
+    }
+
+
+def choose_status(
+    config: ExperimentConfig,
+    metrics: Dict[str, float],
+    pade_code_sha256: str,
+) -> Dict[str, object]:
+    paired = paired_control_summary(config, metrics, pade_code_sha256)
+    same_mode_rows = [
+        row
+        for row in previous_completed_rows()
+        if _row_matches_bucket(row, config, include_enable_pade=True)
+    ]
+    best_same_mode = _best_row(same_mode_rows)
+    is_mode_best = best_same_mode is None or better_than(metrics, row_metrics(best_same_mode))
+
+    if config.enable_pade:
+        if paired["paired_outcome"] == "better_than_paired_control":
+            status = "pade_beats_control"
+        elif paired["paired_outcome"] == "tied_paired_control":
+            status = "pade_ties_control"
+        elif paired["paired_outcome"] == "worse_than_paired_control":
+            status = "pade_loses_to_control"
+        else:
+            status = "pade_no_control_baseline"
+    else:
+        status = "control_reference" if is_mode_best else "control_not_best_in_bucket"
+
+    paired["status"] = status
+    paired["comparison_bucket"] = _comparison_bucket(config)
+    paired["bucket_best"] = is_mode_best
+    return paired
 
 
 def append_result(row: Dict[str, object]) -> None:
@@ -412,6 +668,8 @@ def build_eval_command() -> List[str]:
 def summary_lines(summary: Dict[str, object]) -> List[str]:
     ordered_keys = [
         "status",
+        "comparison_bucket",
+        "bucket_best",
         "pade_target_file",
         "pade_code_sha256",
         "pade_snapshot_file",
@@ -428,8 +686,25 @@ def summary_lines(summary: Dict[str, object]) -> List[str]:
         "pade_n",
         "max_order",
         "interval",
+        "enable_pade",
         "pade_only_single_step",
         "pade_denom_threshold",
+        "total_images",
+        "batch_size",
+        "seed",
+        "cfg_scale",
+        "num_sampling_steps",
+        "paired_control_scope",
+        "paired_control_timestamp",
+        "paired_outcome",
+        "paired_control_lpips",
+        "paired_control_relative_l1",
+        "paired_control_ssim",
+        "paired_control_rmse",
+        "paired_delta_lpips",
+        "paired_delta_relative_l1",
+        "paired_delta_ssim",
+        "paired_delta_rmse",
         "approx_total_steps",
         "pade_steps",
         "taylor_steps",
@@ -481,10 +756,12 @@ def main() -> int:
         metrics = load_eval_metrics()
         approx_stats = load_approx_stats()
         total_seconds = time.time() - total_start
-        status = choose_status(metrics)
+        status_info = choose_status(config, metrics, pade_target["pade_code_sha256"])
 
         summary: Dict[str, object] = {
-            "status": status,
+            "status": status_info["status"],
+            "comparison_bucket": status_info["comparison_bucket"],
+            "bucket_best": status_info["bucket_best"],
             "pade_target_file": pade_target["pade_target_file"],
             "pade_code_sha256": pade_target["pade_code_sha256"],
             "pade_snapshot_file": "",
@@ -501,8 +778,25 @@ def main() -> int:
             "pade_n": config.pade_n,
             "max_order": config.max_order,
             "interval": config.interval,
+            "enable_pade": config.enable_pade,
             "pade_only_single_step": config.pade_only_single_step,
             "pade_denom_threshold": config.pade_denom_threshold,
+            "total_images": config.total_images,
+            "batch_size": config.batch_size,
+            "seed": config.seed,
+            "cfg_scale": config.cfg_scale,
+            "num_sampling_steps": config.num_sampling_steps,
+            "paired_control_scope": status_info["paired_control_scope"],
+            "paired_control_timestamp": status_info["paired_control_timestamp"],
+            "paired_outcome": status_info["paired_outcome"],
+            "paired_control_lpips": status_info["paired_control_lpips"],
+            "paired_control_relative_l1": status_info["paired_control_relative_l1"],
+            "paired_control_ssim": status_info["paired_control_ssim"],
+            "paired_control_rmse": status_info["paired_control_rmse"],
+            "paired_delta_lpips": status_info["paired_delta_lpips"],
+            "paired_delta_relative_l1": status_info["paired_delta_relative_l1"],
+            "paired_delta_ssim": status_info["paired_delta_ssim"],
+            "paired_delta_rmse": status_info["paired_delta_rmse"],
             "approx_total_steps": approx_stats["total_steps"],
             "pade_steps": approx_stats["pade_steps"],
             "taylor_steps": approx_stats["taylor_steps"],
@@ -525,8 +819,14 @@ def main() -> int:
                 "pade_n": config.pade_n,
                 "max_order": config.max_order,
                 "interval": config.interval,
+                "enable_pade": str(config.enable_pade).lower(),
                 "pade_only_single_step": str(config.pade_only_single_step).lower(),
                 "pade_denom_threshold": f"{config.pade_denom_threshold:.6g}",
+                "total_images": str(config.total_images),
+                "batch_size": str(config.batch_size),
+                "seed": str(config.seed),
+                "cfg_scale": f"{config.cfg_scale:.6g}",
+                "num_sampling_steps": str(config.num_sampling_steps),
                 "lpips": f"{metrics['lpips']:.6f}",
                 "relative_l1": f"{metrics['relative_l1']:.6f}",
                 "ssim": f"{metrics['ssim']:.6f}",
@@ -541,7 +841,52 @@ def main() -> int:
                 "taylor_calls": str(approx_stats["taylor_calls"]),
                 "pade_step_ratio": f"{approx_stats['pade_step_ratio']:.6f}",
                 "pade_call_ratio": f"{approx_stats['pade_call_ratio']:.6f}",
-                "status": status,
+                "status": status_info["status"],
+                "comparison_bucket": status_info["comparison_bucket"],
+                "bucket_best": str(status_info["bucket_best"]).lower(),
+                "paired_control_scope": status_info["paired_control_scope"],
+                "paired_control_timestamp": status_info["paired_control_timestamp"],
+                "paired_outcome": status_info["paired_outcome"],
+                "paired_control_lpips": (
+                    f"{status_info['paired_control_lpips']:.6f}"
+                    if status_info["paired_control_lpips"] != ""
+                    else ""
+                ),
+                "paired_control_relative_l1": (
+                    f"{status_info['paired_control_relative_l1']:.6f}"
+                    if status_info["paired_control_relative_l1"] != ""
+                    else ""
+                ),
+                "paired_control_ssim": (
+                    f"{status_info['paired_control_ssim']:.6f}"
+                    if status_info["paired_control_ssim"] != ""
+                    else ""
+                ),
+                "paired_control_rmse": (
+                    f"{status_info['paired_control_rmse']:.6f}"
+                    if status_info["paired_control_rmse"] != ""
+                    else ""
+                ),
+                "paired_delta_lpips": (
+                    f"{status_info['paired_delta_lpips']:.6f}"
+                    if status_info["paired_delta_lpips"] != ""
+                    else ""
+                ),
+                "paired_delta_relative_l1": (
+                    f"{status_info['paired_delta_relative_l1']:.6f}"
+                    if status_info["paired_delta_relative_l1"] != ""
+                    else ""
+                ),
+                "paired_delta_ssim": (
+                    f"{status_info['paired_delta_ssim']:.6f}"
+                    if status_info["paired_delta_ssim"] != ""
+                    else ""
+                ),
+                "paired_delta_rmse": (
+                    f"{status_info['paired_delta_rmse']:.6f}"
+                    if status_info["paired_delta_rmse"] != ""
+                    else ""
+                ),
                 "pade_target_file": pade_target["pade_target_file"],
                 "pade_code_sha256": pade_target["pade_code_sha256"],
                 "pade_snapshot_file": str(artifact_dir / "pade_target_snapshot.py"),
@@ -570,8 +915,14 @@ def main() -> int:
                 "pade_n": config.pade_n,
                 "max_order": config.max_order,
                 "interval": config.interval,
+                "enable_pade": str(config.enable_pade).lower(),
                 "pade_only_single_step": str(config.pade_only_single_step).lower(),
                 "pade_denom_threshold": f"{config.pade_denom_threshold:.6g}",
+                "total_images": str(config.total_images),
+                "batch_size": str(config.batch_size),
+                "seed": str(config.seed),
+                "cfg_scale": f"{config.cfg_scale:.6g}",
+                "num_sampling_steps": str(config.num_sampling_steps),
                 "lpips": "0.000000",
                 "relative_l1": "0.000000",
                 "ssim": "0.000000",
@@ -587,6 +938,19 @@ def main() -> int:
                 "pade_step_ratio": "0.000000",
                 "pade_call_ratio": "0.000000",
                 "status": "crash",
+                "comparison_bucket": _comparison_bucket(config),
+                "bucket_best": "false",
+                "paired_control_scope": "",
+                "paired_control_timestamp": "",
+                "paired_outcome": "",
+                "paired_control_lpips": "",
+                "paired_control_relative_l1": "",
+                "paired_control_ssim": "",
+                "paired_control_rmse": "",
+                "paired_delta_lpips": "",
+                "paired_delta_relative_l1": "",
+                "paired_delta_ssim": "",
+                "paired_delta_rmse": "",
                 "pade_target_file": pade_target["pade_target_file"],
                 "pade_code_sha256": pade_target["pade_code_sha256"],
                 "pade_snapshot_file": "",
@@ -606,6 +970,7 @@ def main() -> int:
         print(f"pade_n: {config.pade_n}", flush=True)
         print(f"max_order: {config.max_order}", flush=True)
         print(f"interval: {config.interval}", flush=True)
+        print(f"enable_pade: {config.enable_pade}", flush=True)
         return 1
 
 
