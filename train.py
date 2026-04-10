@@ -8,6 +8,16 @@ Edit the approximation hook in `taylor_utils/__init__.py`, then execute:
     /home/yjs/xdit_env/bin/python train.py
 """
 
+# 中文概览：
+# 这个脚本负责“单次实验”的完整闭环，而不是负责长期搜索调度。
+# 一次运行的主流程是：
+# 1. 校验路径和结果表是否存在
+# 2. 清理旧采样输出
+# 3. 调 sample.py 生成图片
+# 4. 调 eval_image_diff.py 评估指标
+# 5. 结合历史 results.tsv 判断本次状态
+# 6. 归档 runs/<timestamp-...> 并向 results.tsv 追加一行
+
 from __future__ import annotations
 
 import argparse
@@ -221,6 +231,7 @@ def merge_config(args: argparse.Namespace) -> ExperimentConfig:
 
 
 def ensure_paths_exist() -> None:
+    # 先把运行依赖的关键路径检查一遍，避免实验跑到中途才因路径缺失报错。
     required_paths = [
         XDIT_PYTHON,
         SAMPLE_SCRIPT,
@@ -235,6 +246,8 @@ def ensure_paths_exist() -> None:
 
 
 def ensure_results_tsv() -> None:
+    # results.tsv 是整个搜索过程的累计账本：
+    # 不存在就创建；字段升级过就按当前表头重写，尽量兼容旧记录。
     if not RESULTS_TSV.exists():
         RESULTS_TSV.parent.mkdir(parents=True, exist_ok=True)
         with RESULTS_TSV.open("w", newline="", encoding="utf-8") as handle:
@@ -270,6 +283,7 @@ def git_value(*args: str) -> str:
 
 
 def cleanup_sample_output() -> None:
+    # 每轮实验前清理 pade_samples 下的关键产物，保证后续读取到的是本轮结果。
     SAMPLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for pattern in ("*.png", "eval.txt", "eval_metrics.json", "train_summary.json", "approx_stats.json"):
         for path in SAMPLE_OUTPUT_DIR.glob(pattern):
@@ -278,6 +292,7 @@ def cleanup_sample_output() -> None:
 
 
 def run_command(command: List[str], cwd: Path, timeout_seconds: int, label: str) -> float:
+    # 统一封装外部命令执行，同时返回耗时，方便后面做 latency 对比。
     print(f"[train.py] Running {label}: {' '.join(command)}", flush=True)
     start = time.time()
     subprocess.run(command, cwd=cwd, check=True, timeout=timeout_seconds)
@@ -285,6 +300,7 @@ def run_command(command: List[str], cwd: Path, timeout_seconds: int, label: str)
 
 
 def load_eval_metrics() -> Dict[str, float]:
+    # 从评估脚本输出的 JSON 中提取最终聚合指标，供后续状态判定使用。
     metrics_path = SAMPLE_OUTPUT_DIR / "eval_metrics.json"
     if not metrics_path.exists():
         raise FileNotFoundError(f"Missing evaluation output: {metrics_path}")
@@ -307,6 +323,7 @@ def load_eval_metrics() -> Dict[str, float]:
 
 
 def load_approx_stats() -> Dict[str, float]:
+    # 近似统计文件不是强依赖；缺失时返回零值，避免影响主流程落盘。
     stats_path = SAMPLE_OUTPUT_DIR / "approx_stats.json"
     if not stats_path.exists():
         return {
@@ -421,6 +438,7 @@ def _row_matches_control_baseline(row: Dict[str, str], config: ExperimentConfig)
 
 
 def previous_completed_rows() -> Iterable[Dict[str, str]]:
+    # 只把非 crash 的历史运行当作可比较样本。
     if not RESULTS_TSV.exists():
         return []
     with RESULTS_TSV.open("r", newline="", encoding="utf-8") as handle:
@@ -442,6 +460,8 @@ def row_sample_seconds(row: Dict[str, str]) -> float:
 
 
 def _best_row(rows: Iterable[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    # 与 program.md 里的指标优先级保持一致：
+    # LPIPS -> Relative L1 -> SSIM -> RMSE
     row_list = list(rows)
     if not row_list:
         return None
@@ -480,6 +500,11 @@ def paired_control_summary(
     sample_seconds: float,
     pade_code_sha256: str,
 ) -> Dict[str, object]:
+    # 这里负责给当前候选找一个“纯 Taylor 对照组”。
+    # 优先级是：
+    # 1. 同代码快照下的 pure Taylor
+    # 2. standing baseline
+    # 3. 同 bucket 下历史上最合适的 pure Taylor
     default_summary: Dict[str, object] = {
         "paired_control_scope": "none",
         "paired_control_timestamp": "",
@@ -567,6 +592,8 @@ def choose_status(
     sample_seconds: float,
     pade_code_sha256: str,
 ) -> Dict[str, object]:
+    # 先和 pure Taylor 对照组比较，再结合延迟预算给当前候选打标签。
+    # 这个状态会同时写入 results.tsv 和 runs/<...>/train_summary.json。
     paired = paired_control_summary(config, metrics, sample_seconds, pade_code_sha256)
     same_mode_rows = [
         row
@@ -608,6 +635,7 @@ def append_result(row: Dict[str, object]) -> None:
 
 
 def inspect_pade_target() -> Dict[str, object]:
+    # 读取当前被搜索文件的源码和哈希，保证每次 run 都能追溯到具体实现版本。
     source_bytes = PADE_TARGET_FILE.read_bytes()
     return {
         "pade_target_file": str(PADE_TARGET_FILE),
@@ -622,6 +650,11 @@ def archive_run(
     summary: Dict[str, object],
     pade_target: Dict[str, object],
 ) -> Path:
+    # 每次运行都单独归档，保存：
+    # - 当时的近似实现快照
+    # - 评估结果
+    # - 汇总 JSON
+    # 这样后续可以脱离工作区直接复盘单次实验。
     run_dir = RUNS_DIR / f"{timestamp}-m{config.pade_m}-n{config.pade_n}-k{config.max_order}-i{config.interval}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -651,6 +684,7 @@ def archive_run(
 
 
 def build_sample_command(config: ExperimentConfig) -> List[str]:
+    # 这里把固定 bucket 参数展开成 sample.py 的命令行参数。
     command = [
         str(XDIT_PYTHON),
         str(SAMPLE_SCRIPT),
@@ -687,6 +721,7 @@ def build_sample_command(config: ExperimentConfig) -> List[str]:
 
 
 def build_eval_command() -> List[str]:
+    # 评估脚本统一比较 baseline_samples 与 pade_samples。
     return [
         str(XDIT_PYTHON),
         str(EVAL_SCRIPT),
@@ -766,6 +801,8 @@ def summary_lines(summary: Dict[str, object]) -> List[str]:
 
 
 def main() -> int:
+    # main() 负责把一次实验串起来：
+    # 参数解析 -> 环境准备 -> 采样 -> 评估 -> 状态判定 -> 归档 -> 结果落表。
     args = parse_args()
     config = merge_config(args)
 
@@ -780,18 +817,21 @@ def main() -> int:
     total_start = time.time()
 
     try:
+        # 第一步：运行采样，实际调用 TaylorSeer-DiT/sample.py 生成样本。
         sample_seconds = run_command(
             build_sample_command(config),
             cwd=TAYLORSEER_DIR,
             timeout_seconds=config.timeout_seconds,
             label="sampling",
         )
+        # 第二步：对生成结果做离线评估，产出 eval_metrics.json。
         eval_seconds = run_command(
             build_eval_command(),
             cwd=AUTORESEARCH_DIR,
             timeout_seconds=max(600, min(config.timeout_seconds, 3600)),
             label="evaluation",
         )
+        # 第三步：读取指标和近似调用统计，结合历史结果给当前实验定性。
         metrics = load_eval_metrics()
         approx_stats = load_approx_stats()
         total_seconds = time.time() - total_start
@@ -802,6 +842,7 @@ def main() -> int:
             pade_target["pade_code_sha256"],
         )
 
+        # 第四步：组装当前运行的完整摘要，既用于打印，也用于归档和写表。
         summary: Dict[str, object] = {
             "status": status_info["status"],
             "comparison_bucket": status_info["comparison_bucket"],
@@ -857,8 +898,10 @@ def main() -> int:
             "artifact_dir": "",
             "description": config.description,
         }
+        # 第五步：将本轮产物写入 runs/<timestamp-...>/，形成可回溯快照。
         artifact_dir = archive_run(config, timestamp, summary, pade_target)
 
+        # 第六步：把本轮结果追加到 results.tsv，供下一轮做历史比较。
         append_result(
             {
                 "timestamp": timestamp,
@@ -972,6 +1015,7 @@ def main() -> int:
             print(line, flush=True)
         return 0
     except Exception as exc:  # noqa: BLE001
+        # 即使失败也要把 crash 记录进 results.tsv，避免搜索历史出现“空洞”。
         total_seconds = time.time() - total_start
         error_text = f"{type(exc).__name__}: {exc}"
         print(error_text, file=sys.stderr, flush=True)

@@ -2,6 +2,12 @@
 
 This repo is being used as an autonomous research harness for TaylorSeer-DiT.
 
+中文速览：
+
+- `program.md` 负责定义研究任务边界、评估口径和搜索纪律。
+- `train.py` 是单次实验入口；它不负责长期调度，只负责把“一次候选实验”完整跑完并落盘。
+- 真正被搜索和替换的近似实现，默认集中在 `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py` 的 `pade_formula_mn()`。
+
 The experiment entrypoint is `train.py` in this repo. It runs one approximation-family experiment end to end:
 
 1. clears old generated samples
@@ -10,6 +16,15 @@ The experiment entrypoint is `train.py` in this repo. It runs one approximation-
 4. reads the metrics
 5. appends one row to `results.tsv`
 6. writes run artifacts under `runs/`
+
+对应中文流程：
+
+1. 清理上一次采样残留，避免旧结果污染本次评估。
+2. 调用 TaylorSeer 的 `sample.py` 生成当前候选近似函数的样本。
+3. 调用 `eval_image_diff.py`，把新样本和基线样本做指标对比。
+4. 读取评估指标与近似统计信息。
+5. 结合延迟预算和基线结果，给本次运行打状态标签。
+6. 把摘要写入 `results.tsv`，并把快照和评估产物归档到 `runs/`。
 
 ## In-scope files
 
@@ -30,6 +45,11 @@ You may inspect these external files as needed:
 - `/home/yjs/eval_image_diff.py`
 
 ## Objective
+
+中文解释：
+
+- 当前目标不是继续狭义地“调 Padé 参数”，而是把 `pade_formula_mn()` 当成统一近似接口，尝试更广义的函数族。
+- 判定标准分两层：先满足延迟预算，再比较图像质量指标。
 
 Stop treating the current search as a Padé-optimization task.
 Use `pade_formula_mn()` as the implementation hook for a broader approximation-family search that can represent a better alternative to the current TaylorSeer approximation path.
@@ -78,6 +98,11 @@ Do not reopen runtime-parameter search during this phase.
 Do not combine a runtime-parameter change with an approximation-family code change in the same evaluation.
 
 ## Primary search surface
+
+中文解释：
+
+- 日常迭代时，主要只改一个地方：`pade_formula_mn()`。
+- 这样每次实验的归因最清晰，便于从 `results.tsv` 和 `runs/` 回看“哪一个函数族假设导致了什么结果”。
 
 Normal candidate iterations must keep the implementation scope as narrow as possible.
 During this phase, the intended editable search surface is:
@@ -157,6 +182,11 @@ Do not use `pade_search_loop.py` or add any new loop-controller or supervisor.
 
 ## Execution model
 
+中文解释：
+
+- `train.py` 一次只跑一个候选实验，不负责 while 循环。
+- “持续搜索”由当前 agent 会话负责：看结果、改函数、再运行下一次。
+
 The command below executes exactly one experiment iteration:
 
 ```bash
@@ -191,6 +221,11 @@ grep '^status:\|^paired_outcome:\|^latency_within_budget:\|^sample_seconds:\|^sa
 ```
 
 ## Loop
+
+中文解释：
+
+- 每轮循环都必须重新读磁盘上的 `results.tsv` 和最新 `runs/`，而不是依赖聊天上下文记忆。
+- 这样即使会话中断，也能从磁盘状态恢复。
 
 LOOP FOREVER until the human stops you:
 
