@@ -7,6 +7,7 @@ CONTINUE_PROMPT="${CONTINUE_PROMPT:-continue}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-3}"
 CODEX_BIN="${CODEX_BIN:-codex}"
 LOG_FILE="${LOG_FILE:-$WORKDIR/codex_loop.log}"
+BLOCKER_STATUS=200
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<'USAGE'
@@ -53,6 +54,19 @@ log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*"
 }
 
+output_has_blocker() {
+  local output_file="$1"
+  grep -Eiq \
+    'bwrap: No permissions to create a new namespace|still cannot continue|no valid way to continue|blocked before any command starts|lacks write access|still cannot write|cannot write the Pad|Until shell execution works again|Until those environment constraints are fixed' \
+    "$output_file"
+}
+
+run_codex_with_log() {
+  local output_file="$1"
+  shift
+  "$@" 2>&1 | tee "$output_file"
+}
+
 stop_requested=0
 on_signal() {
   stop_requested=1
@@ -63,21 +77,47 @@ trap on_signal INT TERM
 run_once() {
   cd "$WORKDIR"
 
+  local resume_log
+  local resume_status
+  local bootstrap_log
+  local bootstrap_status
+
   log "attempting resume from latest codex session"
-  if "$CODEX_BIN" exec resume --last "${EXTRA_ARGS[@]}" "$CONTINUE_PROMPT"; then
-    log "resume path finished successfully"
-    return 0
+  resume_log="$(mktemp)"
+  if run_codex_with_log "$resume_log" "$CODEX_BIN" exec resume --last "${EXTRA_ARGS[@]}" "$CONTINUE_PROMPT"; then
+    if output_has_blocker "$resume_log"; then
+      resume_status=$BLOCKER_STATUS
+      log "resume path reported a blocker despite zero exit; falling back to program.md bootstrap"
+    else
+      rm -f "$resume_log"
+      log "resume path finished successfully"
+      return 0
+    fi
+  else
+    resume_status=$?
+    log "resume path failed with status=$resume_status; falling back to program.md bootstrap"
   fi
+  rm -f "$resume_log"
 
-  resume_status=$?
-  log "resume path failed with status=$resume_status; falling back to program.md bootstrap"
-
-  if "$CODEX_BIN" exec "${EXTRA_ARGS[@]}" - < "$PROGRAM_MD"; then
+  bootstrap_log="$(mktemp)"
+  if run_codex_with_log "$bootstrap_log" "$CODEX_BIN" exec "${EXTRA_ARGS[@]}" - < "$PROGRAM_MD"; then
+    if output_has_blocker "$bootstrap_log"; then
+      rm -f "$bootstrap_log"
+      log "bootstrap path reported a blocker despite zero exit; stopping loop to avoid retrying a broken session"
+      return "$BLOCKER_STATUS"
+    fi
+    rm -f "$bootstrap_log"
     log "bootstrap from program.md finished successfully"
     return 0
   fi
 
   bootstrap_status=$?
+  if output_has_blocker "$bootstrap_log"; then
+    rm -f "$bootstrap_log"
+    log "bootstrap path failed due to an environment blocker; stopping loop to avoid retrying without a fix"
+    return "$BLOCKER_STATUS"
+  fi
+  rm -f "$bootstrap_log"
   log "bootstrap from program.md failed with status=$bootstrap_status"
   return "$bootstrap_status"
 }
@@ -95,6 +135,10 @@ while [[ "$stop_requested" -eq 0 ]]; do
   else
     status=$?
     log "codex iteration failed with status=$status"
+    if [[ "$status" -eq "$BLOCKER_STATUS" ]]; then
+      stop_requested=1
+      log "environment blocker detected; stopping loop instead of retrying"
+    fi
   fi
 
   if [[ "$stop_requested" -ne 0 ]]; then

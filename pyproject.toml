@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "autoresearch"
 version = "0.1.0"
@@ -20,6 +24,9 @@ dependencies = [
 torch = [
     { index = "pytorch-cu128" },
 ]
+
+[tool.setuptools]
+py-modules = ["prepare", "train"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

@@ -1,0 +1,18 @@
+{
+  "status": "discard",
+  "lpips": 0.7715981739759445,
+  "relative_l1": 1.0572467745094403,
+  "ssim": 0.20349704329656795,
+  "rmse": 10.177345636965528,
+  "psnr": 9.914695454375737,
+  "cosine": 0.8291829116767588,
+  "sample_seconds": 1234.0710446834564,
+  "eval_seconds": 23.115679264068604,
+  "total_seconds": 1257.18767619133,
+  "pade_m": 2,
+  "pade_n": 1,
+  "max_order": 3,
+  "interval": 4,
+  "artifact_dir": "/home/yjs/autoresearch/runs/20260317-194200-m2-n1-k3-i4",
+  "description": "candidate [2/1] pade 100img"
+}

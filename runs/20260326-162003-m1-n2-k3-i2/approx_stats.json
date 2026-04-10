@@ -1,0 +1,13 @@
+{
+  "total_steps": 6200,
+  "pade_steps": 6100,
+  "taylor_steps": 101,
+  "mixed_steps": 1,
+  "pure_pade_steps": 6099,
+  "pure_taylor_steps": 100,
+  "pade_calls": 341599,
+  "taylor_calls": 5601,
+  "num_batches": 50,
+  "pade_step_ratio": 0.9838709677419355,
+  "pade_call_ratio": 0.9838680875576037
+}

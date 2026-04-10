@@ -219,6 +219,52 @@ Suggested order:
 6. use `pade_step_ratio` and `pade_call_ratio` only as diagnostics, not as primary optimization targets
 7. if a candidate crashes due to an obvious implementation bug, fix the bug and continue the same search direction
 
+## Candidate idea shortlist for `pade_formula_mn()`
+
+To avoid search drift, bias candidate selection toward the following families first.
+These are not mandatory, but they are the preferred search frontier for this phase.
+
+1. Weighted Taylor family
+   - Keep Taylor as the base approximation.
+   - Apply conservative decay or reweighting to higher-order terms.
+   - Prefer cheap, numerically stable variants first.
+
+2. Taylor plus light rational correction
+   - Use Taylor as the main path.
+   - Add a small rational correction only when the local coefficients look safe.
+   - Keep denominator handling conservative and cheap.
+
+3. Piecewise approximation family
+   - Use one formula in the safe region and fall back to Taylor in the risky region.
+   - Safe/risky decisions may depend on step distance, coefficient magnitude, derivative ratios, denominator margin, or finite-value checks.
+
+4. Blended hybrid family
+   - Blend between Taylor and a stronger approximation using a bounded confidence weight.
+   - Prefer smooth blending over hard switching when cost is similar.
+   - The blend must collapse back toward Taylor when confidence is low.
+
+5. Single-step-specialized family
+   - Since the current runtime bucket is conservative and often emphasizes short extrapolation, it is acceptable to design approximations specialized for the single-step case first.
+   - Do not optimize for broad generality before proving a win in the actual bucket.
+
+## Anti-drift guidance for candidate selection
+
+When choosing the next idea, prefer the following order:
+
+1. smallest change to `pade_formula_mn()` that tests one approximation-family hypothesis
+2. numerically safer candidate before more aggressive candidate
+3. cheaper candidate before more expensive candidate when quality upside is unclear
+4. fallback-to-Taylor design before fully replacing Taylor everywhere
+5. latency-budget-compliant candidate before marginally better but slower candidate
+
+Avoid drifting into the following unless the human explicitly asks:
+
+- reopening runtime-parameter search
+- redesigning `train.py` beyond bookkeeping or baseline logic
+- broad edits across multiple functions in `__init__.py` when `pade_formula_mn()` alone can express the hypothesis
+- optimizing Padé identity or theory for its own sake instead of optimizing the practical approximation family
+- increasing complexity without a clear path to staying within the latency budget
+
 ## Output
 
 Each run prints a stable summary that starts with `---`.
