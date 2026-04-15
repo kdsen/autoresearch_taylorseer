@@ -1,0 +1,137 @@
+[train.py] Running sampling: /home/yjs/xdit_env/bin/python /home/yjs/TaylorSeer/TaylorSeer-DiT/sample.py --pade-m 1 --pade-n 2 --max-order 3 --interval 3 --pade-denom-threshold 0.001 --total-images 100 --batch-size 2 --seed 42 --cfg-scale 1.5 --num-sampling-steps 250 --enable-pade --pade-only-single-step
+/home/yjs/xdit_env/lib/python3.10/site-packages/torch/backends/__init__.py:46: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)
+  self.setter(val)
+/home/yjs/xdit_env/lib/python3.10/site-packages/transformers/utils/generic.py:441: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
+/home/yjs/xdit_env/lib/python3.10/site-packages/transformers/utils/generic.py:309: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  _torch_pytree._register_pytree_node(
+/home/yjs/xdit_env/lib/python3.10/site-packages/diffusers/utils/outputs.py:63: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+/home/yjs/xdit_env/lib/python3.10/site-packages/diffusers/utils/outputs.py:63: FutureWarning: `torch.utils._pytree._register_pytree_node` is deprecated. Please use `torch.utils._pytree.register_pytree_node` instead.
+  torch.utils._pytree._register_pytree_node(
+GPU count: 8
+Current device: 0
+GPU name: NVIDIA GeForce RTX 3090
+  0%|          | 0/50 [00:00<?, ?it/s]  2%|▏         | 1/50 [00:06<05:32,  6.78s/it]  4%|▍         | 2/50 [00:13<05:11,  6.48s/it]  6%|▌         | 3/50 [00:19<05:00,  6.40s/it]  8%|▊         | 4/50 [00:25<04:52,  6.36s/it] 10%|█         | 5/50 [00:31<04:45,  6.35s/it] 12%|█▏        | 6/50 [00:38<04:38,  6.34s/it] 14%|█▍        | 7/50 [00:44<04:32,  6.33s/it] 16%|█▌        | 8/50 [00:50<04:26,  6.34s/it] 18%|█▊        | 9/50 [00:57<04:20,  6.34s/it] 20%|██        | 10/50 [01:03<04:13,  6.35s/it] 22%|██▏       | 11/50 [01:10<04:07,  6.35s/it] 24%|██▍       | 12/50 [01:16<04:01,  6.36s/it] 26%|██▌       | 13/50 [01:22<03:55,  6.36s/it] 28%|██▊       | 14/50 [01:29<03:49,  6.37s/it] 30%|███       | 15/50 [01:35<03:42,  6.37s/it] 32%|███▏      | 16/50 [01:41<03:36,  6.38s/it] 34%|███▍      | 17/50 [01:48<03:30,  6.38s/it] 36%|███▌      | 18/50 [01:54<03:24,  6.38s/it] 38%|███▊      | 19/50 [02:01<03:17,  6.38s/it] 40%|████      | 20/50 [02:07<03:11,  6.39s/it] 42%|████▏     | 21/50 [02:13<03:05,  6.39s/it] 44%|████▍     | 22/50 [02:20<02:58,  6.39s/it] 46%|████▌     | 23/50 [02:26<02:52,  6.39s/it] 48%|████▊     | 24/50 [02:33<02:46,  6.39s/it] 50%|█████     | 25/50 [02:39<02:39,  6.39s/it] 52%|█████▏    | 26/50 [02:45<02:33,  6.39s/it] 54%|█████▍    | 27/50 [02:52<02:27,  6.39s/it] 56%|█████▌    | 28/50 [02:58<02:20,  6.40s/it] 58%|█████▊    | 29/50 [03:05<02:14,  6.40s/it] 60%|██████    | 30/50 [03:11<02:08,  6.40s/it] 62%|██████▏   | 31/50 [03:17<02:01,  6.41s/it] 64%|██████▍   | 32/50 [03:24<01:55,  6.41s/it] 66%|██████▌   | 33/50 [03:30<01:48,  6.41s/it] 68%|██████▊   | 34/50 [03:37<01:42,  6.41s/it] 70%|███████   | 35/50 [03:43<01:36,  6.41s/it] 72%|███████▏  | 36/50 [03:49<01:29,  6.42s/it] 74%|███████▍  | 37/50 [03:56<01:23,  6.42s/it] 76%|███████▌  | 38/50 [04:02<01:17,  6.42s/it] 78%|███████▊  | 39/50 [04:09<01:10,  6.42s/it] 80%|████████  | 40/50 [04:15<01:04,  6.42s/it] 82%|████████▏ | 41/50 [04:22<00:57,  6.42s/it] 84%|████████▍ | 42/50 [04:28<00:51,  6.42s/it] 86%|████████▌ | 43/50 [04:34<00:44,  6.42s/it] 88%|████████▊ | 44/50 [04:41<00:38,  6.42s/it] 90%|█████████ | 45/50 [04:47<00:32,  6.42s/it] 92%|█████████▏| 46/50 [04:54<00:25,  6.42s/it] 94%|█████████▍| 47/50 [05:00<00:19,  6.42s/it] 96%|█████████▌| 48/50 [05:07<00:12,  6.42s/it] 98%|█████████▊| 49/50 [05:13<00:06,  6.42s/it]100%|██████████| 50/50 [05:19<00:00,  6.43s/it]100%|██████████| 50/50 [05:19<00:00,  6.40s/it]
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+79.89860736614399 TFLOPs
+[train.py] Running evaluation: /home/yjs/xdit_env/bin/python /home/yjs/eval_image_diff.py --path1 /home/yjs/baseline_samples --path2 /home/yjs/TaylorSeer/TaylorSeer-DiT/pade_samples --output-dir /home/yjs/TaylorSeer/TaylorSeer-DiT/pade_samples
+/home/yjs/xdit_env/lib/python3.10/site-packages/torchvision/models/_utils.py:208: UserWarning: The parameter 'pretrained' is deprecated since 0.13 and may be removed in the future, please use 'weights' instead.
+  warnings.warn(
+/home/yjs/xdit_env/lib/python3.10/site-packages/torchvision/models/_utils.py:223: UserWarning: Arguments other than a weight enum or `None` for 'weights' are deprecated since 0.13 and may be removed in the future. The current behavior is equivalent to passing `weights=AlexNet_Weights.IMAGENET1K_V1`. You can also use `weights=AlexNet_Weights.DEFAULT` to get the most up-to-date weights.
+  warnings.warn(msg)
+Setting up [LPIPS] perceptual loss: trunk [alex], v[0.1], spatial [off]
+Loading model from: /home/yjs/xdit_env/lib/python3.10/site-packages/lpips/weights/v0.1/alex.pth
+计算图像指标:   0%|          | 0/100 [00:00<?, ?it/s]计算图像指标:   1%|          | 1/100 [00:00<00:35,  2.82it/s]计算图像指标:   3%|▎         | 3/100 [00:00<00:13,  7.35it/s]计算图像指标:   5%|▌         | 5/100 [00:00<00:10,  9.07it/s]计算图像指标:   7%|▋         | 7/100 [00:00<00:09, 10.21it/s]计算图像指标:   9%|▉         | 9/100 [00:00<00:08, 11.33it/s]计算图像指标:  11%|█         | 11/100 [00:01<00:07, 11.47it/s]计算图像指标:  13%|█▎        | 13/100 [00:01<00:07, 12.32it/s]计算图像指标:  15%|█▌        | 15/100 [00:01<00:06, 12.32it/s]计算图像指标:  17%|█▋        | 17/100 [00:01<00:06, 12.91it/s]计算图像指标:  19%|█▉        | 19/100 [00:01<00:06, 12.90it/s]计算图像指标:  21%|██        | 21/100 [00:01<00:05, 13.36it/s]计算图像指标:  23%|██▎       | 23/100 [00:02<00:05, 13.04it/s]计算图像指标:  25%|██▌       | 25/100 [00:02<00:05, 13.46it/s]计算图像指标:  27%|██▋       | 27/100 [00:02<00:05, 12.96it/s]计算图像指标:  29%|██▉       | 29/100 [00:02<00:05, 13.38it/s]计算图像指标:  31%|███       | 31/100 [00:02<00:05, 13.04it/s]计算图像指标:  33%|███▎      | 33/100 [00:02<00:04, 13.50it/s]计算图像指标:  35%|███▌      | 35/100 [00:02<00:04, 13.07it/s]计算图像指标:  37%|███▋      | 37/100 [00:03<00:04, 13.38it/s]计算图像指标:  39%|███▉      | 39/100 [00:03<00:04, 13.16it/s]计算图像指标:  41%|████      | 41/100 [00:03<00:04, 13.46it/s]计算图像指标:  43%|████▎     | 43/100 [00:03<00:04, 13.01it/s]计算图像指标:  45%|████▌     | 45/100 [00:03<00:04, 13.22it/s]计算图像指标:  47%|████▋     | 47/100 [00:03<00:04, 12.89it/s]计算图像指标:  49%|████▉     | 49/100 [00:04<00:04, 12.61it/s]计算图像指标:  51%|█████     | 51/100 [00:04<00:03, 13.15it/s]计算图像指标:  53%|█████▎    | 53/100 [00:04<00:03, 12.67it/s]计算图像指标:  55%|█████▌    | 55/100 [00:04<00:03, 13.00it/s]计算图像指标:  57%|█████▋    | 57/100 [00:04<00:03, 12.83it/s]计算图像指标:  59%|█████▉    | 59/100 [00:04<00:03, 12.87it/s]计算图像指标:  61%|██████    | 61/100 [00:04<00:03, 12.72it/s]计算图像指标:  63%|██████▎   | 63/100 [00:05<00:02, 12.40it/s]计算图像指标:  65%|██████▌   | 65/100 [00:05<00:02, 12.79it/s]计算图像指标:  67%|██████▋   | 67/100 [00:05<00:02, 12.64it/s]计算图像指标:  69%|██████▉   | 69/100 [00:05<00:02, 12.92it/s]计算图像指标:  71%|███████   | 71/100 [00:05<00:02, 12.66it/s]计算图像指标:  73%|███████▎  | 73/100 [00:05<00:02, 12.98it/s]计算图像指标:  75%|███████▌  | 75/100 [00:06<00:01, 12.51it/s]计算图像指标:  77%|███████▋  | 77/100 [00:06<00:01, 12.55it/s]计算图像指标:  79%|███████▉  | 79/100 [00:06<00:01, 13.10it/s]计算图像指标:  81%|████████  | 81/100 [00:06<00:01, 12.70it/s]计算图像指标:  83%|████████▎ | 83/100 [00:06<00:01, 13.19it/s]计算图像指标:  85%|████████▌ | 85/100 [00:06<00:01, 12.90it/s]计算图像指标:  87%|████████▋ | 87/100 [00:06<00:00, 13.47it/s]计算图像指标:  89%|████████▉ | 89/100 [00:07<00:00, 13.00it/s]计算图像指标:  91%|█████████ | 91/100 [00:07<00:00, 13.31it/s]计算图像指标:  93%|█████████▎| 93/100 [00:07<00:00, 12.99it/s]计算图像指标:  95%|█████████▌| 95/100 [00:07<00:00, 13.26it/s]计算图像指标:  97%|█████████▋| 97/100 [00:07<00:00, 12.80it/s]计算图像指标:  99%|█████████▉| 99/100 [00:07<00:00, 13.22it/s]计算图像指标: 100%|██████████| 100/100 [00:07<00:00, 12.59it/s]
+路径 1: /home/yjs/baseline_samples
+路径 2: /home/yjs/TaylorSeer/TaylorSeer-DiT/pade_samples
+
+所有图像的平均指标:
+  平均 SSIM: 0.8994682555275051
+  平均 PSNR: 28.53138878408052
+  平均 LPIPS: 0.06147803130093962
+  平均余弦相似度: 0.992147556017549
+  平均 Relative L1: 1.0569626540736896
+  平均 RMSE: 5.59744146762476
+---
+status: family_beats_baseline_within_latency_budget
+comparison_bucket: pade_m=1,pade_n=2,max_order=3,interval=3,pade_only_single_step=true,pade_denom_threshold=0.001,total_images=100,batch_size=2,seed=42,cfg_scale=1.5,num_sampling_steps=250
+bucket_best: False
+pade_target_file: /home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py
+pade_code_sha256: 6cd1bbbda14a72a942bfa45cc69a8a6eb2749d5cc2c4b97c4cef0745a9d817b8
+pade_snapshot_file: /home/yjs/autoresearch/runs/20260410-040216-m1-n2-k3-i3/pade_target_snapshot.py
+lpips: 0.061478
+relative_l1: 1.056963
+ssim: 0.899468
+rmse: 5.597441
+psnr: 28.531389
+cosine: 0.992148
+sample_seconds: 342.876817
+eval_seconds: 13.975376
+total_seconds: 356.852941
+latency_baseline_timestamp: 20260329-171615
+latency_baseline_sample_seconds: 751.529000
+sample_seconds_budget: 789.105450
+sample_seconds_ratio: 0.456239
+latency_within_budget: True
+pade_m: 1
+pade_n: 2
+max_order: 3
+interval: 3
+enable_pade: True
+pade_only_single_step: True
+pade_denom_threshold: 0.001000
+total_images: 100
+batch_size: 2
+seed: 42
+cfg_scale: 1.500000
+num_sampling_steps: 250
+paired_control_scope: standing_pure_taylor
+paired_control_timestamp: 20260329-171615
+paired_outcome: better_than_paired_control
+paired_control_lpips: 0.061478
+paired_control_relative_l1: 1.056978
+paired_control_ssim: 0.899468
+paired_control_rmse: 5.597430
+paired_delta_lpips: 0.000000
+paired_delta_relative_l1: -0.000015
+paired_delta_ssim: 0.000000
+paired_delta_rmse: 0.000011
+approx_total_steps: 50
+pade_steps: 50
+taylor_steps: 0
+mixed_steps: 0
+pade_calls: 50
+taylor_calls: 0
+pade_step_ratio: 1.000000
+pade_call_ratio: 1.000000
+artifact_dir: /home/yjs/autoresearch/runs/20260410-040216-m1-n2-k3-i3
+description: candidate: penultimate-step-only rationally softened 62.3046875%-cubic damping using |quadratic|/|linear| on last-layer MLP under interval-3 latency budget

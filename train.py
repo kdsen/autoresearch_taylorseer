@@ -1,630 +1,1097 @@
 """
-Autoresearch pretraining script. Single-GPU, single-file.
-Cherry-picked and simplified from nanochat.
-Usage: uv run train.py
+Unified experiment entrypoint for TaylorSeer approximation-family optimization.
+
+This replaces the original autoresearch training script for this local setup.
+The runtime evaluation bucket is fixed to the interval-3 standing-baseline setup.
+Edit the approximation hook in `taylor_utils/__init__.py`, then execute:
+
+    /home/yjs/xdit_env/bin/python train.py
 """
 
-import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+# 中文概览：
+# 这个脚本负责“单次实验”的完整闭环，而不是负责长期搜索调度。
+# 一次运行的主流程是：
+# 1. 校验路径和结果表是否存在
+# 2. 清理旧采样输出
+# 3. 调 sample.py 生成图片
+# 4. 调 eval_image_diff.py 评估指标
+# 5. 结合历史 results.tsv 判断本次状态
+# 6. 归档 runs/<timestamp-...> 并向 results.tsv 追加一行
 
-import gc
-import math
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
 import time
-from dataclasses import dataclass, asdict
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
-
-from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
-
-# ---------------------------------------------------------------------------
-# GPT Model
-# ---------------------------------------------------------------------------
-
-@dataclass
-class GPTConfig:
-    sequence_len: int = 2048
-    vocab_size: int = 32768
-    n_layer: int = 12
-    n_head: int = 6
-    n_kv_head: int = 6
-    n_embd: int = 768
-    window_pattern: str = "SSSL"
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional
 
 
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
+AUTORESEARCH_DIR = Path("/home/yjs/autoresearch")
+XDIT_PYTHON = Path("/home/yjs/xdit_env/bin/python")
+TAYLORSEER_DIR = Path("/home/yjs/TaylorSeer/TaylorSeer-DiT")
+SAMPLE_SCRIPT = TAYLORSEER_DIR / "sample.py"
+EVAL_SCRIPT = Path("/home/yjs/eval_image_diff.py")
+BASELINE_DIR = Path("/home/yjs/baseline_samples")
+SAMPLE_OUTPUT_DIR = TAYLORSEER_DIR / "pade_samples"
+RUNS_DIR = AUTORESEARCH_DIR / "runs"
+RESULTS_TSV = AUTORESEARCH_DIR / "results.tsv"
+PADE_TARGET_FILE = TAYLORSEER_DIR / "taylor_utils" / "__init__.py"
 
-
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
-
-
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:]
-    y1 = x1 * cos + x2 * sin
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
-
-    def forward(self, x, ve, cos_sin, window_size):
-        B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
-
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k)
-
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
-        y = y.contiguous().view(B, T, -1)
-        y = self.c_proj(y)
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, config, layer_idx):
-        super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
-
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
-
-
-class GPT(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.window_sizes = self._compute_window_sizes(config)
-        self.transformer = nn.ModuleDict({
-            "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
-        })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
-        })
-        # Rotary embeddings
-        self.rotary_seq_len = config.sequence_len * 10
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.register_buffer("cos", cos, persistent=False)
-        self.register_buffer("sin", sin, persistent=False)
-
-    @torch.no_grad()
-    def init_weights(self):
-        # Embedding and unembedding
-        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
-        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
-        # Transformer blocks
-        n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5
-        for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj.weight)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
-        # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
-        # Value embeddings
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
-        # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
-        self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
-
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        if device is None:
-            device = self.transformer.wte.weight.device
-        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (base ** (channel_range / head_dim))
-        t = torch.arange(seq_len, dtype=torch.float32, device=device)
-        freqs = torch.outer(t, inv_freq)
-        cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16()
-        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
-        return cos, sin
-
-    def _compute_window_sizes(self, config):
-        pattern = config.window_pattern.upper()
-        assert all(c in "SL" for c in pattern)
-        long_window = config.sequence_len
-        short_window = long_window // 2
-        char_to_window = {"L": (long_window, 0), "S": (short_window, 0)}
-        window_sizes = []
-        for layer_idx in range(config.n_layer):
-            char = pattern[layer_idx % len(pattern)]
-            window_sizes.append(char_to_window[char])
-        window_sizes[-1] = (long_window, 0)
-        return window_sizes
-
-    def estimate_flops(self):
-        """Estimated FLOPs per token (forward + backward)."""
-        nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
-        t = self.config.sequence_len
-        attn_flops = 0
-        for window_size in self.window_sizes:
-            window = window_size[0]
-            effective_seq = t if window < 0 else min(window, t)
-            attn_flops += 12 * h * q * effective_seq
-        return 6 * (nparams - nparams_exclude) + attn_flops
-
-    def num_scaling_params(self):
-        wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
-        lm_head = sum(p.numel() for p in self.lm_head.parameters())
-        transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
-        return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
-        }
-
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
-        model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
-        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
-        optimizer = MuonAdamW(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
-
-    def forward(self, idx, targets=None, reduction='mean'):
-        B, T = idx.size()
-        assert T <= self.cos.size(1)
-        cos_sin = self.cos[:, :T], self.sin[:, :T]
-
-        x = self.transformer.wte(idx)
-        x = norm(x)
-        x0 = x
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
-        x = norm(x)
-
-        softcap = 15
-        logits = self.lm_head(x)
-        logits = logits.float()
-        logits = softcap * torch.tanh(logits / softcap)
-
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1),
-                                   ignore_index=-1, reduction=reduction)
-            return loss
-        return logits
-
-# ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single GPU only)
-# ---------------------------------------------------------------------------
-
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
+RESULT_FIELDS = [
+    "timestamp",
+    "commit",
+    "branch",
+    "pade_m",
+    "pade_n",
+    "max_order",
+    "interval",
+    "enable_pade",
+    "pade_only_single_step",
+    "pade_denom_threshold",
+    "total_images",
+    "batch_size",
+    "seed",
+    "cfg_scale",
+    "num_sampling_steps",
+    "lpips",
+    "relative_l1",
+    "ssim",
+    "rmse",
+    "psnr",
+    "cosine",
+    "approx_total_steps",
+    "pade_steps",
+    "taylor_steps",
+    "mixed_steps",
+    "pade_calls",
+    "taylor_calls",
+    "pade_step_ratio",
+    "pade_call_ratio",
+    "status",
+    "comparison_bucket",
+    "bucket_best",
+    "paired_control_scope",
+    "paired_control_timestamp",
+    "paired_outcome",
+    "paired_control_lpips",
+    "paired_control_relative_l1",
+    "paired_control_ssim",
+    "paired_control_rmse",
+    "paired_delta_lpips",
+    "paired_delta_relative_l1",
+    "paired_delta_ssim",
+    "paired_delta_rmse",
+    "latency_baseline_timestamp",
+    "latency_baseline_sample_seconds",
+    "sample_seconds_budget",
+    "sample_seconds_ratio",
+    "latency_within_budget",
+    "pade_target_file",
+    "pade_code_sha256",
+    "pade_snapshot_file",
+    "description",
+    "sample_seconds",
+    "eval_seconds",
+    "total_seconds",
+    "artifact_dir",
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
-
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
-    # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar express orthogonalization
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
-    # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+METRIC_TOLERANCE = 1e-6
+STANDING_CONTROL_TIMESTAMP = "20260329-171615"
+LATENCY_BUDGET_RATIO = 1.05
 
 
-class MuonAdamW(torch.optim.Optimizer):
-    """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
+@dataclass
+class ExperimentConfig:
+    # Freeze runtime parameters at the interval-3 evaluation anchor.
+    # The search surface is the approximation-family implementation behind
+    # pade_formula_mn(), not the runtime parameters themselves.
+    description: str = "standing-baseline approximation-family search at interval 3"
+    pade_m: int = 1
+    pade_n: int = 2
+    max_order: int = 3
+    interval: int = 3
+    enable_pade: bool = True
+    pade_only_single_step: bool = True
+    pade_denom_threshold: float = 0.001
+    total_images: int = 100
+    batch_size: int = 2
+    seed: int = 42
+    cfg_scale: float = 1.5
+    num_sampling_steps: int = 250
+    timeout_seconds: int = 7200
+    archive_images: bool = False
 
-    def __init__(self, param_groups):
-        super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
-    def _step_adamw(self, group):
-        for p in group['params']:
-            if p.grad is None:
-                continue
-            grad = p.grad
-            state = self.state[p]
-            if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
-            state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+EXPERIMENT = ExperimentConfig()
+DEFAULT_CONFIG = ExperimentConfig()
+BOOL_FIELDS = {"enable_pade", "pade_only_single_step"}
+INT_FIELDS = {
+    "pade_m",
+    "pade_n",
+    "max_order",
+    "interval",
+    "total_images",
+    "batch_size",
+    "seed",
+    "num_sampling_steps",
+}
+FLOAT_FIELDS = {"pade_denom_threshold", "cfg_scale"}
+COMPARISON_FIELDS = [
+    "pade_m",
+    "pade_n",
+    "max_order",
+    "interval",
+    "pade_only_single_step",
+    "pade_denom_threshold",
+    "total_images",
+    "batch_size",
+    "seed",
+    "cfg_scale",
+    "num_sampling_steps",
+]
+CONTROL_BASELINE_FIELDS = [
+    "max_order",
+    "interval",
+    "total_images",
+    "batch_size",
+    "seed",
+    "cfg_scale",
+    "num_sampling_steps",
+]
 
-    def _step_muon(self, group):
-        params = group['params']
-        if not params:
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--description", type=str, default=None)
+    parser.add_argument("--pade-m", type=int, default=None)
+    parser.add_argument("--pade-n", type=int, default=None)
+    parser.add_argument(
+        "--enable-pade",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--total-images", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--cfg-scale", type=float, default=None)
+    parser.add_argument("--num-sampling-steps", type=int, default=None)
+    parser.add_argument("--timeout-seconds", type=int, default=None)
+    parser.add_argument(
+        "--archive-images",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    return parser.parse_args()
+
+
+def merge_config(args: argparse.Namespace) -> ExperimentConfig:
+    config = ExperimentConfig(**EXPERIMENT.__dict__)
+    for arg_name, field_name in [
+        ("description", "description"),
+        ("pade_m", "pade_m"),
+        ("pade_n", "pade_n"),
+        ("enable_pade", "enable_pade"),
+        ("total_images", "total_images"),
+        ("batch_size", "batch_size"),
+        ("seed", "seed"),
+        ("cfg_scale", "cfg_scale"),
+        ("num_sampling_steps", "num_sampling_steps"),
+        ("timeout_seconds", "timeout_seconds"),
+    ]:
+        value = getattr(args, arg_name)
+        if value is not None:
+            setattr(config, field_name, value)
+
+    if args.archive_images is not None:
+        config.archive_images = args.archive_images
+
+    if config.pade_m < 1 or config.pade_n < 1:
+        raise ValueError("pade_m and pade_n must both be >= 1")
+    if (config.pade_m, config.pade_n) not in {(1, 2), (2, 1)}:
+        raise ValueError("current phase only allows Padé orders [1/2] or [2/1]")
+    if config.max_order < (config.pade_m + config.pade_n):
+        raise ValueError(
+            f"max_order={config.max_order} must be at least pade_m + pade_n = "
+            f"{config.pade_m + config.pade_n}"
+        )
+    if config.pade_denom_threshold <= 0:
+        raise ValueError("pade_denom_threshold must be > 0")
+
+    return config
+
+
+def ensure_paths_exist() -> None:
+    # 先把运行依赖的关键路径检查一遍，避免实验跑到中途才因路径缺失报错。
+    required_paths = [
+        XDIT_PYTHON,
+        SAMPLE_SCRIPT,
+        EVAL_SCRIPT,
+        BASELINE_DIR,
+        TAYLORSEER_DIR,
+        PADE_TARGET_FILE,
+    ]
+    missing = [str(path) for path in required_paths if not path.exists()]
+    if missing:
+        raise FileNotFoundError("Missing required paths:\n" + "\n".join(missing))
+
+
+def ensure_results_tsv() -> None:
+    # results.tsv 是整个搜索过程的累计账本：
+    # 不存在就创建；字段升级过就按当前表头重写，尽量兼容旧记录。
+    if not RESULTS_TSV.exists():
+        RESULTS_TSV.parent.mkdir(parents=True, exist_ok=True)
+        with RESULTS_TSV.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS, delimiter="\t")
+            writer.writeheader()
+        return
+
+    with RESULTS_TSV.open("r", newline="", encoding="utf-8") as handle:
+        first_line = handle.readline().rstrip("\n")
+        if first_line.split("\t") == RESULT_FIELDS:
             return
-        p = params[0]
-        state = self.state[p]
-        num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-        stacked_grads = torch.stack([p.grad for p in params])
-        stacked_params = torch.stack(params)
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group["weight_decay"])
-        muon_step_fused(stacked_grads, stacked_params,
-                        state["momentum_buffer"], state["second_momentum_buffer"],
-                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                        self._muon_beta2_t, group["ns_steps"], red_dim)
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+        handle.seek(0)
+        reader = csv.DictReader(handle, delimiter="\t")
+        rows = list(reader)
 
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            if group['kind'] == 'adamw':
-                self._step_adamw(group)
-            elif group['kind'] == 'muon':
-                self._step_muon(group)
+    with RESULTS_TSV.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS, delimiter="\t")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in RESULT_FIELDS})
 
-# ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
-# ---------------------------------------------------------------------------
 
-# Model architecture
-ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
-HEAD_DIM = 128          # target head dimension for attention
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+def git_value(*args: str) -> str:
+    try:
+        output = subprocess.check_output(
+            ["git", "-C", str(AUTORESEARCH_DIR), *args],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return output or "unknown"
+    except subprocess.SubprocessError:
+        return "unknown"
 
-# Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
-EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
-UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
-MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2      # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95) # Adam beta1, beta2
-WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
-# Model size
-DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+def cleanup_sample_output() -> None:
+    # 每轮实验前清理 pade_samples 下的关键产物，保证后续读取到的是本轮结果。
+    SAMPLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    for pattern in ("*.png", "eval.txt", "eval_metrics.json", "train_summary.json", "approx_stats.json"):
+        for path in SAMPLE_OUTPUT_DIR.glob(pattern):
+            if path.is_file():
+                path.unlink()
 
-# ---------------------------------------------------------------------------
-# Setup: tokenizer, model, optimizer, dataloader
-# ---------------------------------------------------------------------------
 
-t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+def run_command(command: List[str], cwd: Path, timeout_seconds: int, label: str) -> float:
+    # 统一封装外部命令执行，同时返回耗时，方便后面做 latency 对比。
+    print(f"[train.py] Running {label}: {' '.join(command)}", flush=True)
+    start = time.time()
+    subprocess.run(command, cwd=cwd, check=True, timeout=timeout_seconds)
+    return time.time() - start
 
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
 
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
+def load_eval_metrics() -> Dict[str, float]:
+    # 从评估脚本输出的 JSON 中提取最终聚合指标，供后续状态判定使用。
+    metrics_path = SAMPLE_OUTPUT_DIR / "eval_metrics.json"
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"Missing evaluation output: {metrics_path}")
+
+    with metrics_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    overall = payload.get("overall_average")
+    if not isinstance(overall, dict):
+        raise ValueError("eval_metrics.json does not contain overall_average")
+
+    return {
+        "lpips": float(overall["LPIPS"]),
+        "relative_l1": float(overall["Relative L1"]),
+        "ssim": float(overall["SSIM"]),
+        "rmse": float(overall["RMSE"]),
+        "psnr": float(overall["PSNR"]),
+        "cosine": float(overall["Cosine Similarity"]),
+    }
+
+
+def load_approx_stats() -> Dict[str, float]:
+    # 近似统计文件不是强依赖；缺失时返回零值，避免影响主流程落盘。
+    stats_path = SAMPLE_OUTPUT_DIR / "approx_stats.json"
+    if not stats_path.exists():
+        return {
+            "total_steps": 0,
+            "pade_steps": 0,
+            "taylor_steps": 0,
+            "mixed_steps": 0,
+            "pade_calls": 0,
+            "taylor_calls": 0,
+            "pade_step_ratio": 0.0,
+            "pade_call_ratio": 0.0,
+        }
+
+    with stats_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    return {
+        "total_steps": int(payload.get("total_steps", 0)),
+        "pade_steps": int(payload.get("pade_steps", 0)),
+        "taylor_steps": int(payload.get("taylor_steps", 0)),
+        "mixed_steps": int(payload.get("mixed_steps", 0)),
+        "pade_calls": int(payload.get("pade_calls", 0)),
+        "taylor_calls": int(payload.get("taylor_calls", 0)),
+        "pade_step_ratio": float(payload.get("pade_step_ratio", 0.0)),
+        "pade_call_ratio": float(payload.get("pade_call_ratio", 0.0)),
+    }
+
+
+def _format_bool(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value).strip().lower()
+
+
+def _format_bucket_value(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, float):
+        return f"{value:.6g}"
+    return str(value)
+
+
+def _infer_enable_pade_from_legacy_row(row: Dict[str, str]) -> bool:
+    explicit = row.get("enable_pade", "")
+    if explicit:
+        return _format_bool(explicit) == "true"
+
+    pade_calls = row.get("pade_calls", "")
+    taylor_calls = row.get("taylor_calls", "")
+    if pade_calls and taylor_calls:
+        try:
+            if int(pade_calls) == 0 and int(taylor_calls) > 0:
+                return False
+        except ValueError:
+            pass
+
+    description = row.get("description", "").lower()
+    if "pure taylor" in description:
+        return False
+
+    return True
+
+
+def _row_field_value(row: Dict[str, str], field_name: str) -> object:
+    if field_name == "enable_pade":
+        return _infer_enable_pade_from_legacy_row(row)
+
+    raw_value = row.get(field_name, "")
+    if raw_value == "":
+        return getattr(DEFAULT_CONFIG, field_name)
+
+    if field_name in BOOL_FIELDS:
+        return _format_bool(raw_value) == "true"
+    if field_name in INT_FIELDS:
+        return int(raw_value)
+    if field_name in FLOAT_FIELDS:
+        return float(raw_value)
+    return raw_value
+
+
+def _config_field_value(config: ExperimentConfig, field_name: str) -> object:
+    return getattr(config, field_name)
+
+
+def _comparison_bucket(config: ExperimentConfig) -> str:
+    return ",".join(
+        f"{field_name}={_format_bucket_value(_config_field_value(config, field_name))}"
+        for field_name in COMPARISON_FIELDS
     )
 
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
 
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
+def _row_matches_bucket(
+    row: Dict[str, str],
+    config: ExperimentConfig,
+    *,
+    include_enable_pade: bool,
+) -> bool:
+    fields = list(COMPARISON_FIELDS)
+    if include_enable_pade:
+        fields.append("enable_pade")
+    return all(
+        _row_field_value(row, field_name) == _config_field_value(config, field_name)
+        for field_name in fields
+    )
 
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+def _row_matches_control_baseline(row: Dict[str, str], config: ExperimentConfig) -> bool:
+    return all(
+        _row_field_value(row, field_name) == _config_field_value(config, field_name)
+        for field_name in CONTROL_BASELINE_FIELDS
+    )
 
-optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
-)
 
-model = torch.compile(model, dynamic=False)
+def previous_completed_rows() -> Iterable[Dict[str, str]]:
+    # 只把非 crash 的历史运行当作可比较样本。
+    if not RESULTS_TSV.exists():
+        return []
+    with RESULTS_TSV.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        return [row for row in reader if row.get("status") != "crash"]
 
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
 
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
+def row_metrics(row: Dict[str, str]) -> Dict[str, float]:
+    return {
+        "lpips": float(row["lpips"]),
+        "relative_l1": float(row["relative_l1"]),
+        "ssim": float(row["ssim"]),
+        "rmse": float(row["rmse"]),
+    }
 
-# Schedules (all based on progress = training_time / TIME_BUDGET)
 
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
+def row_sample_seconds(row: Dict[str, str]) -> float:
+    return float(row["sample_seconds"])
+
+
+def _best_row(rows: Iterable[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    # 与 program.md 里的指标优先级保持一致：
+    # LPIPS -> Relative L1 -> SSIM -> RMSE
+    row_list = list(rows)
+    if not row_list:
+        return None
+    return min(
+        row_list,
+        key=lambda row: (
+            float(row["lpips"]),
+            float(row["relative_l1"]),
+            -float(row["ssim"]),
+            float(row["rmse"]),
+        ),
+    )
+
+
+def better_than(current: Dict[str, float], previous: Dict[str, float]) -> bool:
+    comparisons = [
+        ("lpips", "min"),
+        ("relative_l1", "min"),
+        ("ssim", "max"),
+        ("rmse", "min"),
+    ]
+    for key, direction in comparisons:
+        cur = current[key]
+        prev = previous[key]
+        if abs(cur - prev) <= METRIC_TOLERANCE:
+            continue
+        if direction == "min":
+            return cur < prev
+        return cur > prev
+    return False
+
+
+def paired_control_summary(
+    config: ExperimentConfig,
+    metrics: Dict[str, float],
+    sample_seconds: float,
+    pade_code_sha256: str,
+) -> Dict[str, object]:
+    # 这里负责给当前候选找一个“纯 Taylor 对照组”。
+    # 优先级是：
+    # 1. 同代码快照下的 pure Taylor
+    # 2. standing baseline
+    # 3. 同 bucket 下历史上最合适的 pure Taylor
+    default_summary: Dict[str, object] = {
+        "paired_control_scope": "none",
+        "paired_control_timestamp": "",
+        "paired_outcome": "unpaired",
+        "paired_control_lpips": "",
+        "paired_control_relative_l1": "",
+        "paired_control_ssim": "",
+        "paired_control_rmse": "",
+        "paired_delta_lpips": "",
+        "paired_delta_relative_l1": "",
+        "paired_delta_ssim": "",
+        "paired_delta_rmse": "",
+        "latency_baseline_timestamp": "",
+        "latency_baseline_sample_seconds": "",
+        "sample_seconds_budget": "",
+        "sample_seconds_ratio": "",
+        "latency_within_budget": "",
+    }
+
+    candidate_rows = [
+        row
+        for row in previous_completed_rows()
+        if _row_matches_control_baseline(row, config)
+        and not _row_field_value(row, "enable_pade")
+    ]
+    best_control = None
+    control_scope = "none"
+    same_code_controls = [
+        row for row in candidate_rows if row.get("pade_code_sha256", "") == pade_code_sha256
+    ]
+    if same_code_controls:
+        best_control = max(same_code_controls, key=lambda row: row.get("timestamp", ""))
+        control_scope = "same_code_pure_taylor"
     else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+        standing_controls = [
+            row
+            for row in candidate_rows
+            if row.get("timestamp", "") == STANDING_CONTROL_TIMESTAMP
+        ]
+        if standing_controls:
+            best_control = standing_controls[0]
+            control_scope = "standing_pure_taylor"
+        elif candidate_rows:
+            best_control = _best_row(candidate_rows)
+            control_scope = "fallback_pure_taylor"
 
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
+    if best_control is None:
+        return default_summary
 
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    control_metrics = row_metrics(best_control)
+    control_sample_seconds = row_sample_seconds(best_control)
+    sample_seconds_budget = control_sample_seconds * LATENCY_BUDGET_RATIO
+    latency_within_budget = sample_seconds <= sample_seconds_budget
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
+    if better_than(metrics, control_metrics):
+        paired_outcome = "better_than_paired_control"
+    elif better_than(control_metrics, metrics):
+        paired_outcome = "worse_than_paired_control"
+    else:
+        paired_outcome = "tied_paired_control"
 
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+    return {
+        "paired_control_scope": control_scope,
+        "paired_control_timestamp": best_control.get("timestamp", ""),
+        "paired_outcome": paired_outcome,
+        "paired_control_lpips": control_metrics["lpips"],
+        "paired_control_relative_l1": control_metrics["relative_l1"],
+        "paired_control_ssim": control_metrics["ssim"],
+        "paired_control_rmse": control_metrics["rmse"],
+        "paired_delta_lpips": metrics["lpips"] - control_metrics["lpips"],
+        "paired_delta_relative_l1": metrics["relative_l1"] - control_metrics["relative_l1"],
+        "paired_delta_ssim": metrics["ssim"] - control_metrics["ssim"],
+        "paired_delta_rmse": metrics["rmse"] - control_metrics["rmse"],
+        "latency_baseline_timestamp": best_control.get("timestamp", ""),
+        "latency_baseline_sample_seconds": control_sample_seconds,
+        "sample_seconds_budget": sample_seconds_budget,
+        "sample_seconds_ratio": sample_seconds / control_sample_seconds,
+        "latency_within_budget": latency_within_budget,
+    }
 
-while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
-        loss.backward()
-        x, y, epoch = next(train_loader)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+def choose_status(
+    config: ExperimentConfig,
+    metrics: Dict[str, float],
+    sample_seconds: float,
+    pade_code_sha256: str,
+) -> Dict[str, object]:
+    # 先和 pure Taylor 对照组比较，再结合延迟预算给当前候选打标签。
+    # 这个状态会同时写入 results.tsv 和 runs/<...>/train_summary.json。
+    paired = paired_control_summary(config, metrics, sample_seconds, pade_code_sha256)
+    same_mode_rows = [
+        row
+        for row in previous_completed_rows()
+        if _row_matches_bucket(row, config, include_enable_pade=True)
+    ]
+    best_same_mode = _best_row(same_mode_rows)
+    is_mode_best = best_same_mode is None or better_than(metrics, row_metrics(best_same_mode))
 
-    train_loss_f = train_loss.item()
+    if config.enable_pade:
+        latency_ok = paired["latency_within_budget"] is True
+        if paired["paired_outcome"] == "better_than_paired_control" and latency_ok:
+            status = "family_beats_baseline_within_latency_budget"
+        elif paired["paired_outcome"] == "better_than_paired_control":
+            status = "family_beats_baseline_but_too_slow"
+        elif paired["paired_outcome"] == "tied_paired_control" and latency_ok:
+            status = "family_ties_baseline_within_latency_budget"
+        elif paired["paired_outcome"] == "tied_paired_control":
+            status = "family_ties_baseline_but_too_slow"
+        elif paired["paired_outcome"] == "worse_than_paired_control" and latency_ok:
+            status = "family_within_latency_budget_but_loses_baseline"
+        elif paired["paired_outcome"] == "worse_than_paired_control":
+            status = "family_loses_baseline_and_is_too_slow"
+        else:
+            status = "family_no_baseline"
+    else:
+        status = "control_reference" if is_mode_best else "control_not_best_in_bucket"
 
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
+    paired["status"] = status
+    paired["comparison_bucket"] = _comparison_bucket(config)
+    paired["bucket_best"] = is_mode_best
+    return paired
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
 
-    if step > 10:
-        total_training_time += dt
+def append_result(row: Dict[str, object]) -> None:
+    with RESULTS_TSV.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS, delimiter="\t")
+        writer.writerow(row)
 
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+def inspect_pade_target() -> Dict[str, object]:
+    # 读取当前被搜索文件的源码和哈希，保证每次 run 都能追溯到具体实现版本。
+    source_bytes = PADE_TARGET_FILE.read_bytes()
+    return {
+        "pade_target_file": str(PADE_TARGET_FILE),
+        "pade_code_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "source_bytes": source_bytes,
+    }
 
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
 
-    step += 1
+def archive_run(
+    config: ExperimentConfig,
+    timestamp: str,
+    summary: Dict[str, object],
+    pade_target: Dict[str, object],
+) -> Path:
+    # 每次运行都单独归档，保存：
+    # - 当时的近似实现快照
+    # - 评估结果
+    # - 汇总 JSON
+    # 这样后续可以脱离工作区直接复盘单次实验。
+    run_dir = RUNS_DIR / f"{timestamp}-m{config.pade_m}-n{config.pade_n}-k{config.max_order}-i{config.interval}"
+    run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
+    snapshot_path = run_dir / "pade_target_snapshot.py"
+    snapshot_path.write_bytes(pade_target["source_bytes"])
 
-print()  # newline after \r training log
+    summary["artifact_dir"] = str(run_dir)
+    summary["pade_snapshot_file"] = str(snapshot_path)
+    with (run_dir / "train_summary.json").open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
 
-total_tokens = step * TOTAL_BATCH_SIZE
+    for filename in ("eval.txt", "eval_metrics.json"):
+        source = SAMPLE_OUTPUT_DIR / filename
+        if source.exists():
+            shutil.copy2(source, run_dir / filename)
+    approx_stats = SAMPLE_OUTPUT_DIR / "approx_stats.json"
+    if approx_stats.exists():
+        shutil.copy2(approx_stats, run_dir / "approx_stats.json")
 
-# Final eval
-model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
+    if config.archive_images:
+        image_dir = run_dir / "images"
+        image_dir.mkdir(exist_ok=True)
+        for image_path in SAMPLE_OUTPUT_DIR.glob("*.png"):
+            shutil.copy2(image_path, image_dir / image_path.name)
 
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+    return run_dir
 
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+
+def build_sample_command(config: ExperimentConfig) -> List[str]:
+    # 这里把固定 bucket 参数展开成 sample.py 的命令行参数。
+    command = [
+        str(XDIT_PYTHON),
+        str(SAMPLE_SCRIPT),
+        "--pade-m",
+        str(config.pade_m),
+        "--pade-n",
+        str(config.pade_n),
+        "--max-order",
+        str(config.max_order),
+        "--interval",
+        str(config.interval),
+        "--pade-denom-threshold",
+        str(config.pade_denom_threshold),
+        "--total-images",
+        str(config.total_images),
+        "--batch-size",
+        str(config.batch_size),
+        "--seed",
+        str(config.seed),
+        "--cfg-scale",
+        str(config.cfg_scale),
+        "--num-sampling-steps",
+        str(config.num_sampling_steps),
+    ]
+    if config.enable_pade:
+        command.append("--enable-pade")
+    else:
+        command.append("--no-enable-pade")
+    if config.pade_only_single_step:
+        command.append("--pade-only-single-step")
+    else:
+        command.append("--no-pade-only-single-step")
+    return command
+
+
+def build_eval_command() -> List[str]:
+    # 评估脚本统一比较 baseline_samples 与 pade_samples。
+    return [
+        str(XDIT_PYTHON),
+        str(EVAL_SCRIPT),
+        "--path1",
+        str(BASELINE_DIR),
+        "--path2",
+        str(SAMPLE_OUTPUT_DIR),
+        "--output-dir",
+        str(SAMPLE_OUTPUT_DIR),
+    ]
+
+
+def summary_lines(summary: Dict[str, object]) -> List[str]:
+    ordered_keys = [
+        "status",
+        "comparison_bucket",
+        "bucket_best",
+        "pade_target_file",
+        "pade_code_sha256",
+        "pade_snapshot_file",
+        "lpips",
+        "relative_l1",
+        "ssim",
+        "rmse",
+        "psnr",
+        "cosine",
+        "sample_seconds",
+        "eval_seconds",
+        "total_seconds",
+        "latency_baseline_timestamp",
+        "latency_baseline_sample_seconds",
+        "sample_seconds_budget",
+        "sample_seconds_ratio",
+        "latency_within_budget",
+        "pade_m",
+        "pade_n",
+        "max_order",
+        "interval",
+        "enable_pade",
+        "pade_only_single_step",
+        "pade_denom_threshold",
+        "total_images",
+        "batch_size",
+        "seed",
+        "cfg_scale",
+        "num_sampling_steps",
+        "paired_control_scope",
+        "paired_control_timestamp",
+        "paired_outcome",
+        "paired_control_lpips",
+        "paired_control_relative_l1",
+        "paired_control_ssim",
+        "paired_control_rmse",
+        "paired_delta_lpips",
+        "paired_delta_relative_l1",
+        "paired_delta_ssim",
+        "paired_delta_rmse",
+        "approx_total_steps",
+        "pade_steps",
+        "taylor_steps",
+        "mixed_steps",
+        "pade_calls",
+        "taylor_calls",
+        "pade_step_ratio",
+        "pade_call_ratio",
+        "artifact_dir",
+        "description",
+    ]
+    lines = ["---"]
+    for key in ordered_keys:
+        value = summary[key]
+        if isinstance(value, float):
+            lines.append(f"{key}: {value:.6f}")
+        else:
+            lines.append(f"{key}: {value}")
+    return lines
+
+
+def main() -> int:
+    # main() 负责把一次实验串起来：
+    # 参数解析 -> 环境准备 -> 采样 -> 评估 -> 状态判定 -> 归档 -> 结果落表。
+    args = parse_args()
+    config = merge_config(args)
+
+    ensure_paths_exist()
+    ensure_results_tsv()
+    cleanup_sample_output()
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    commit = git_value("rev-parse", "--short", "HEAD")
+    branch = git_value("branch", "--show-current")
+    pade_target = inspect_pade_target()
+    total_start = time.time()
+
+    try:
+        # 第一步：运行采样，实际调用 TaylorSeer-DiT/sample.py 生成样本。
+        sample_seconds = run_command(
+            build_sample_command(config),
+            cwd=TAYLORSEER_DIR,
+            timeout_seconds=config.timeout_seconds,
+            label="sampling",
+        )
+        # 第二步：对生成结果做离线评估，产出 eval_metrics.json。
+        eval_seconds = run_command(
+            build_eval_command(),
+            cwd=AUTORESEARCH_DIR,
+            timeout_seconds=max(600, min(config.timeout_seconds, 3600)),
+            label="evaluation",
+        )
+        # 第三步：读取指标和近似调用统计，结合历史结果给当前实验定性。
+        metrics = load_eval_metrics()
+        approx_stats = load_approx_stats()
+        total_seconds = time.time() - total_start
+        status_info = choose_status(
+            config,
+            metrics,
+            sample_seconds,
+            pade_target["pade_code_sha256"],
+        )
+
+        # 第四步：组装当前运行的完整摘要，既用于打印，也用于归档和写表。
+        summary: Dict[str, object] = {
+            "status": status_info["status"],
+            "comparison_bucket": status_info["comparison_bucket"],
+            "bucket_best": status_info["bucket_best"],
+            "pade_target_file": pade_target["pade_target_file"],
+            "pade_code_sha256": pade_target["pade_code_sha256"],
+            "pade_snapshot_file": "",
+            "lpips": metrics["lpips"],
+            "relative_l1": metrics["relative_l1"],
+            "ssim": metrics["ssim"],
+            "rmse": metrics["rmse"],
+            "psnr": metrics["psnr"],
+            "cosine": metrics["cosine"],
+            "sample_seconds": sample_seconds,
+            "eval_seconds": eval_seconds,
+            "total_seconds": total_seconds,
+            "latency_baseline_timestamp": status_info["latency_baseline_timestamp"],
+            "latency_baseline_sample_seconds": status_info["latency_baseline_sample_seconds"],
+            "sample_seconds_budget": status_info["sample_seconds_budget"],
+            "sample_seconds_ratio": status_info["sample_seconds_ratio"],
+            "latency_within_budget": status_info["latency_within_budget"],
+            "pade_m": config.pade_m,
+            "pade_n": config.pade_n,
+            "max_order": config.max_order,
+            "interval": config.interval,
+            "enable_pade": config.enable_pade,
+            "pade_only_single_step": config.pade_only_single_step,
+            "pade_denom_threshold": config.pade_denom_threshold,
+            "total_images": config.total_images,
+            "batch_size": config.batch_size,
+            "seed": config.seed,
+            "cfg_scale": config.cfg_scale,
+            "num_sampling_steps": config.num_sampling_steps,
+            "paired_control_scope": status_info["paired_control_scope"],
+            "paired_control_timestamp": status_info["paired_control_timestamp"],
+            "paired_outcome": status_info["paired_outcome"],
+            "paired_control_lpips": status_info["paired_control_lpips"],
+            "paired_control_relative_l1": status_info["paired_control_relative_l1"],
+            "paired_control_ssim": status_info["paired_control_ssim"],
+            "paired_control_rmse": status_info["paired_control_rmse"],
+            "paired_delta_lpips": status_info["paired_delta_lpips"],
+            "paired_delta_relative_l1": status_info["paired_delta_relative_l1"],
+            "paired_delta_ssim": status_info["paired_delta_ssim"],
+            "paired_delta_rmse": status_info["paired_delta_rmse"],
+            "approx_total_steps": approx_stats["total_steps"],
+            "pade_steps": approx_stats["pade_steps"],
+            "taylor_steps": approx_stats["taylor_steps"],
+            "mixed_steps": approx_stats["mixed_steps"],
+            "pade_calls": approx_stats["pade_calls"],
+            "taylor_calls": approx_stats["taylor_calls"],
+            "pade_step_ratio": approx_stats["pade_step_ratio"],
+            "pade_call_ratio": approx_stats["pade_call_ratio"],
+            "artifact_dir": "",
+            "description": config.description,
+        }
+        # 第五步：将本轮产物写入 runs/<timestamp-...>/，形成可回溯快照。
+        artifact_dir = archive_run(config, timestamp, summary, pade_target)
+
+        # 第六步：把本轮结果追加到 results.tsv，供下一轮做历史比较。
+        append_result(
+            {
+                "timestamp": timestamp,
+                "commit": commit,
+                "branch": branch,
+                "pade_m": config.pade_m,
+                "pade_n": config.pade_n,
+                "max_order": config.max_order,
+                "interval": config.interval,
+                "enable_pade": str(config.enable_pade).lower(),
+                "pade_only_single_step": str(config.pade_only_single_step).lower(),
+                "pade_denom_threshold": f"{config.pade_denom_threshold:.6g}",
+                "total_images": str(config.total_images),
+                "batch_size": str(config.batch_size),
+                "seed": str(config.seed),
+                "cfg_scale": f"{config.cfg_scale:.6g}",
+                "num_sampling_steps": str(config.num_sampling_steps),
+                "lpips": f"{metrics['lpips']:.6f}",
+                "relative_l1": f"{metrics['relative_l1']:.6f}",
+                "ssim": f"{metrics['ssim']:.6f}",
+                "rmse": f"{metrics['rmse']:.6f}",
+                "psnr": f"{metrics['psnr']:.6f}",
+                "cosine": f"{metrics['cosine']:.6f}",
+                "approx_total_steps": str(approx_stats["total_steps"]),
+                "pade_steps": str(approx_stats["pade_steps"]),
+                "taylor_steps": str(approx_stats["taylor_steps"]),
+                "mixed_steps": str(approx_stats["mixed_steps"]),
+                "pade_calls": str(approx_stats["pade_calls"]),
+                "taylor_calls": str(approx_stats["taylor_calls"]),
+                "pade_step_ratio": f"{approx_stats['pade_step_ratio']:.6f}",
+                "pade_call_ratio": f"{approx_stats['pade_call_ratio']:.6f}",
+                "status": status_info["status"],
+                "comparison_bucket": status_info["comparison_bucket"],
+                "bucket_best": str(status_info["bucket_best"]).lower(),
+                "paired_control_scope": status_info["paired_control_scope"],
+                "paired_control_timestamp": status_info["paired_control_timestamp"],
+                "paired_outcome": status_info["paired_outcome"],
+                "paired_control_lpips": (
+                    f"{status_info['paired_control_lpips']:.6f}"
+                    if status_info["paired_control_lpips"] != ""
+                    else ""
+                ),
+                "paired_control_relative_l1": (
+                    f"{status_info['paired_control_relative_l1']:.6f}"
+                    if status_info["paired_control_relative_l1"] != ""
+                    else ""
+                ),
+                "paired_control_ssim": (
+                    f"{status_info['paired_control_ssim']:.6f}"
+                    if status_info["paired_control_ssim"] != ""
+                    else ""
+                ),
+                "paired_control_rmse": (
+                    f"{status_info['paired_control_rmse']:.6f}"
+                    if status_info["paired_control_rmse"] != ""
+                    else ""
+                ),
+                "paired_delta_lpips": (
+                    f"{status_info['paired_delta_lpips']:.6f}"
+                    if status_info["paired_delta_lpips"] != ""
+                    else ""
+                ),
+                "paired_delta_relative_l1": (
+                    f"{status_info['paired_delta_relative_l1']:.6f}"
+                    if status_info["paired_delta_relative_l1"] != ""
+                    else ""
+                ),
+                "paired_delta_ssim": (
+                    f"{status_info['paired_delta_ssim']:.6f}"
+                    if status_info["paired_delta_ssim"] != ""
+                    else ""
+                ),
+                "paired_delta_rmse": (
+                    f"{status_info['paired_delta_rmse']:.6f}"
+                    if status_info["paired_delta_rmse"] != ""
+                    else ""
+                ),
+                "latency_baseline_timestamp": status_info["latency_baseline_timestamp"],
+                "latency_baseline_sample_seconds": (
+                    f"{status_info['latency_baseline_sample_seconds']:.3f}"
+                    if status_info["latency_baseline_sample_seconds"] != ""
+                    else ""
+                ),
+                "sample_seconds_budget": (
+                    f"{status_info['sample_seconds_budget']:.3f}"
+                    if status_info["sample_seconds_budget"] != ""
+                    else ""
+                ),
+                "sample_seconds_ratio": (
+                    f"{status_info['sample_seconds_ratio']:.6f}"
+                    if status_info["sample_seconds_ratio"] != ""
+                    else ""
+                ),
+                "latency_within_budget": (
+                    str(status_info["latency_within_budget"]).lower()
+                    if status_info["latency_within_budget"] != ""
+                    else ""
+                ),
+                "pade_target_file": pade_target["pade_target_file"],
+                "pade_code_sha256": pade_target["pade_code_sha256"],
+                "pade_snapshot_file": str(artifact_dir / "pade_target_snapshot.py"),
+                "description": config.description,
+                "sample_seconds": f"{sample_seconds:.3f}",
+                "eval_seconds": f"{eval_seconds:.3f}",
+                "total_seconds": f"{total_seconds:.3f}",
+                "artifact_dir": str(artifact_dir),
+            }
+        )
+
+        for line in summary_lines(summary):
+            print(line, flush=True)
+        return 0
+    except Exception as exc:  # noqa: BLE001
+        # 即使失败也要把 crash 记录进 results.tsv，避免搜索历史出现“空洞”。
+        total_seconds = time.time() - total_start
+        error_text = f"{type(exc).__name__}: {exc}"
+        print(error_text, file=sys.stderr, flush=True)
+        traceback.print_exc()
+        append_result(
+            {
+                "timestamp": timestamp,
+                "commit": commit,
+                "branch": branch,
+                "pade_m": config.pade_m,
+                "pade_n": config.pade_n,
+                "max_order": config.max_order,
+                "interval": config.interval,
+                "enable_pade": str(config.enable_pade).lower(),
+                "pade_only_single_step": str(config.pade_only_single_step).lower(),
+                "pade_denom_threshold": f"{config.pade_denom_threshold:.6g}",
+                "total_images": str(config.total_images),
+                "batch_size": str(config.batch_size),
+                "seed": str(config.seed),
+                "cfg_scale": f"{config.cfg_scale:.6g}",
+                "num_sampling_steps": str(config.num_sampling_steps),
+                "lpips": "0.000000",
+                "relative_l1": "0.000000",
+                "ssim": "0.000000",
+                "rmse": "0.000000",
+                "psnr": "0.000000",
+                "cosine": "0.000000",
+                "approx_total_steps": "0",
+                "pade_steps": "0",
+                "taylor_steps": "0",
+                "mixed_steps": "0",
+                "pade_calls": "0",
+                "taylor_calls": "0",
+                "pade_step_ratio": "0.000000",
+                "pade_call_ratio": "0.000000",
+                "status": "crash",
+                "comparison_bucket": _comparison_bucket(config),
+                "bucket_best": "false",
+                "paired_control_scope": "",
+                "paired_control_timestamp": "",
+                "paired_outcome": "",
+                "paired_control_lpips": "",
+                "paired_control_relative_l1": "",
+                "paired_control_ssim": "",
+                "paired_control_rmse": "",
+                "paired_delta_lpips": "",
+                "paired_delta_relative_l1": "",
+                "paired_delta_ssim": "",
+                "paired_delta_rmse": "",
+                "latency_baseline_timestamp": "",
+                "latency_baseline_sample_seconds": "",
+                "sample_seconds_budget": "",
+                "sample_seconds_ratio": "",
+                "latency_within_budget": "",
+                "pade_target_file": pade_target["pade_target_file"],
+                "pade_code_sha256": pade_target["pade_code_sha256"],
+                "pade_snapshot_file": "",
+                "description": f"{config.description} | {error_text}"[:200],
+                "sample_seconds": "0.000",
+                "eval_seconds": "0.000",
+                "total_seconds": f"{total_seconds:.3f}",
+                "artifact_dir": "",
+            }
+        )
+        print("---", flush=True)
+        print("status: crash", flush=True)
+        print(f"pade_target_file: {pade_target['pade_target_file']}", flush=True)
+        print(f"pade_code_sha256: {pade_target['pade_code_sha256']}", flush=True)
+        print(f"error: {error_text}", flush=True)
+        print(f"pade_m: {config.pade_m}", flush=True)
+        print(f"pade_n: {config.pade_n}", flush=True)
+        print(f"max_order: {config.max_order}", flush=True)
+        print(f"interval: {config.interval}", flush=True)
+        print(f"enable_pade: {config.enable_pade}", flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

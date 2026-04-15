@@ -1,0 +1,18 @@
+{
+  "status": "keep",
+  "lpips": 0.08373031025752425,
+  "relative_l1": 1.0896136913274932,
+  "ssim": 0.8648008688171118,
+  "rmse": 6.483089162743886,
+  "psnr": 26.306295202403973,
+  "cosine": 0.9914637562772293,
+  "sample_seconds": 1534.4212222099304,
+  "eval_seconds": 32.082579135894775,
+  "total_seconds": 1566.5054178237915,
+  "pade_m": 1,
+  "pade_n": 1,
+  "max_order": 4,
+  "interval": 4,
+  "artifact_dir": "/home/yjs/autoresearch/runs/20260317-164634-m1-n1-k4-i4",
+  "description": "baseline [1/1] pade"
+}

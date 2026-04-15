@@ -1,114 +1,337 @@
-# autoresearch
+# autoresearch for TaylorSeer approximation-family optimization
 
-This is an experiment to have the LLM do its own research.
+This repo is being used as an autonomous research harness for TaylorSeer-DiT.
+
+中文速览：
+
+- `program.md` 负责定义研究任务边界、评估口径和搜索纪律。
+- `train.py` 是单次实验入口；它不负责长期调度，只负责把“一次候选实验”完整跑完并落盘。
+- 真正被搜索和替换的近似实现，默认集中在 `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py` 的 `pade_formula_mn()`。
+
+The experiment entrypoint is `train.py` in this repo. It runs one approximation-family experiment end to end:
+
+1. clears old generated samples
+2. runs `/home/yjs/TaylorSeer/TaylorSeer-DiT/sample.py`
+3. runs `/home/yjs/eval_image_diff.py`
+4. reads the metrics
+5. appends one row to `results.tsv`
+6. writes run artifacts under `runs/`
+
+对应中文流程：
+
+1. 清理上一次采样残留，避免旧结果污染本次评估。
+2. 调用 TaylorSeer 的 `sample.py` 生成当前候选近似函数的样本。
+3. 调用 `eval_image_diff.py`，把新样本和基线样本做指标对比。
+4. 读取评估指标与近似统计信息。
+5. 结合延迟预算和基线结果，给本次运行打状态标签。
+6. 把摘要写入 `results.tsv`，并把快照和评估产物归档到 `runs/`。
+
+## In-scope files
+
+Read these files first:
+
+- `README.md`
+- `program.md`
+- `train.py`
+
+Primary code under optimization:
+
+- `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py`
+
+You may inspect these external files as needed:
+
+- `/home/yjs/TaylorSeer/TaylorSeer-DiT/sample.py`
+- `/home/yjs/TaylorSeer/TaylorSeer-DiT/sample_ddp.py`
+- `/home/yjs/eval_image_diff.py`
+
+## Objective
+
+中文解释：
+
+- 当前目标不是继续狭义地“调 Padé 参数”，而是把 `pade_formula_mn()` 当成统一近似接口，尝试更广义的函数族。
+- 判定标准分两层：先满足延迟预算，再比较图像质量指标。
+
+Stop treating the current search as a Padé-optimization task.
+Use `pade_formula_mn()` as the implementation hook for a broader approximation-family search that can represent a better alternative to the current TaylorSeer approximation path.
+Allowed approximation families include, but are not limited to:
+
+- low-order polynomials
+- rational functions
+- piecewise functions
+- hybrid or gated mixtures
+- conservative blends that fall back to Taylor when unsafe
+
+The optimization target for this phase is:
+
+1. stay within the standing latency budget derived from the pure TaylorSeer baseline
+2. beat that baseline on image-quality metrics
+
+Use run `20260329-171615` as the standing baseline reference for this phase.
+That baseline has:
+
+- `lpips=0.061478`
+- `relative_l1=1.056978`
+- `ssim=0.899468`
+- `rmse=5.597430`
+- `sample_seconds=751.529`
+
+Treat "sample_seconds at or around baseline" as a hard latency budget of at most `1.05x` the standing baseline, i.e. at most about `789.105` seconds.
+A candidate that improves quality but clearly exceeds that latency budget does not count as a success for this phase.
+
+## Fixed evaluation bucket
+
+Freeze the runtime bucket during this phase:
+
+- `pade_m=1`
+- `pade_n=2`
+- `max_order=3`
+- `interval=3`
+- `pade_only_single_step=True`
+- `pade_denom_threshold=1e-3`
+- `total_images=100`
+- `batch_size=2`
+- `seed=42`
+- `cfg_scale=1.5`
+- `num_sampling_steps=250`
+
+Do not reopen runtime-parameter search during this phase.
+Do not combine a runtime-parameter change with an approximation-family code change in the same evaluation.
+
+## Primary search surface
+
+中文解释：
+
+- 日常迭代时，主要只改一个地方：`pade_formula_mn()`。
+- 这样每次实验的归因最清晰，便于从 `results.tsv` 和 `runs/` 回看“哪一个函数族假设导致了什么结果”。
+
+Normal candidate iterations must keep the implementation scope as narrow as possible.
+During this phase, the intended editable search surface is:
+
+- `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py`
+- specifically the function `pade_formula_mn()`
+
+Treat `pade_formula_mn()` as the single approximation hook to iterate on.
+The objective is not to preserve Padé semantics; the objective is to discover a better function family behind that hook.
+
+Do not spread the search across unrelated functions unless a change to `pade_formula_mn()` strictly requires a tiny helper adjustment in the same file.
+Do not redesign the broader framework.
+
+## Non-Negotiable Constraints
+
+These rules are strict unless the human explicitly overrides them.
+
+1. Keep the search loop agent-driven.
+   - Do not delegate search control to `pade_search_loop.py` or any other controller script.
+   - The agent must inspect disk state, choose the next candidate, and decide each iteration itself.
+2. Keep `train.py` as the single-run experiment entrypoint.
+   - It may be edited only for result bookkeeping, baseline comparison, or latency-budget logic.
+   - Do not move the search policy into code.
+3. Recover state from disk, not from chat memory.
+   - Re-read `results.tsv` and inspect the latest `runs/` directory.
+4. Keep running until manually interrupted.
+   - Do not ask whether to continue.
+   - Do not ask whether to apply the next `pade_formula_mn()` change.
+5. Prefer foreground execution.
+   - Do not intentionally daemonize or hand off the loop to a background controller.
+6. Do not delete existing runs or results.
+7. Do not revert unrelated local changes.
+8. Keep the implementation scope narrow.
+   - For ordinary candidate iterations, edit only `taylor_utils/__init__.py`.
+   - Within that file, prefer to edit only `pade_formula_mn()`.
+
+## Metric policy
+
+The decision order for candidate runs is:
+
+1. first satisfy the latency budget relative to the standing baseline
+2. among runs that satisfy the latency budget, rank by:
+   - lower `LPIPS`
+   - if tied, lower `Relative L1`
+   - if tied, higher `SSIM`
+   - if tied, lower `RMSE`
+
+For this phase, a candidate is only a true win if it both:
+
+- stays within the standing latency budget
+- beats the standing baseline on the quality metrics above
 
 ## Setup
 
-To set up a new experiment, work with the user to:
+Before starting the loop:
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+1. Create or switch to a dedicated branch such as `autoresearch/function-family-<date>`.
+2. Verify these paths exist:
+   - `/home/yjs/xdit_env/bin/python`
+   - `/home/yjs/TaylorSeer/TaylorSeer-DiT/sample.py`
+   - `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py`
+   - `/home/yjs/eval_image_diff.py`
+   - `/home/yjs/baseline_samples`
+3. Verify imports work in `/home/yjs/xdit_env`.
+4. Confirm `results.tsv` exists or let `train.py` create it.
+5. Confirm `runs/` exists or let `train.py` create it.
 
-Once you get confirmation, kick off the experimentation.
+## What to edit
 
-## Experimentation
+Normal candidate iterations should edit:
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+- `/home/yjs/TaylorSeer/TaylorSeer-DiT/taylor_utils/__init__.py`
+- specifically `pade_formula_mn()`
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+Only edit `train.py` when the attribution harness itself needs improvement.
+Do not use `pade_search_loop.py` or add any new loop-controller or supervisor.
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+## Execution model
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+中文解释：
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+- `train.py` 一次只跑一个候选实验，不负责 while 循环。
+- “持续搜索”由当前 agent 会话负责：看结果、改函数、再运行下一次。
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+The command below executes exactly one experiment iteration:
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
-
-## Output format
-
-Once the script finishes it prints a summary like this:
-
-```
----
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+```bash
+/home/yjs/xdit_env/bin/python train.py > run.log 2>&1
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+That command is intentionally single-run. The indefinite loop is created by the agent reissuing this one-shot command after each completed post-run review.
 
-```
-grep "^val_bpb:" run.log
-```
+Required behavior:
 
-## Logging results
+- Keep the loop alive by repeatedly choosing one approximation-family candidate, running the single-run command once, reading the resulting artifacts, and immediately choosing the next candidate.
+- Treat the active agent session as the loop owner.
+- Do not replace this with a shell `while` loop, daemon, background service, cron job, or local controller.
+- If the environment interrupts the session, resume by rereading `results.tsv` and the latest run directory from disk.
+- Do not ask for confirmation before launching the next candidate if the only changes are `pade_formula_mn()` edits or description text.
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+## Baseline and launch examples
 
-The TSV has a header row and 5 columns:
+The standing baseline is run `20260329-171615`.
+Use it for both quality comparison and latency comparison.
 
-```
-commit	val_bpb	memory_gb	status	description
-```
+Launch one candidate iteration with:
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
-
-Example:
-
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+```bash
+/home/yjs/xdit_env/bin/python train.py   --enable-pade   --pade-m 1   --pade-n 2   --description "candidate: piecewise rational-polynomial approximation under interval-3 latency budget"   > run.log 2>&1
 ```
 
-## The experiment loop
+Read the summary with:
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+```bash
+grep '^status:\|^paired_outcome:\|^latency_within_budget:\|^sample_seconds:\|^sample_seconds_budget:\|^sample_seconds_ratio:\|^lpips:\|^relative_l1:\|^ssim:\|^rmse:' run.log
+```
 
-LOOP FOREVER:
+## Loop
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+中文解释：
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+- 每轮循环都必须重新读磁盘上的 `results.tsv` 和最新 `runs/`，而不是依赖聊天上下文记忆。
+- 这样即使会话中断，也能从磁盘状态恢复。
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+LOOP FOREVER until the human stops you:
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+1. Re-read `results.tsv` and inspect the latest directory under `runs/`.
+2. Keep context usage low. Prefer compact summaries from `results.tsv`, `train_summary.json`, `eval_metrics.json`, and `approx_stats.json`.
+3. Treat `20260329-171615` as the standing baseline.
+4. Identify the current best candidate that satisfies the latency budget.
+5. Choose exactly one next approximation-family hypothesis for `pade_formula_mn()`.
+6. Keep diffs small enough that failures are attributable.
+7. Commit the change when useful for traceability.
+8. Run one experiment.
+9. Read the summary from `run.log`.
+10. If the run crashed, inspect the traceback, log it, fix the obvious implementation issue, and continue.
+11. Use the result to decide the next `pade_formula_mn()` candidate.
+12. Continue immediately.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+## Search strategy
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+Suggested order:
+
+1. start with conservative families that are numerically safe and cheap
+2. prefer piecewise or blended designs that fall back to Taylor when confidence is low
+3. favor hypotheses that plausibly reduce error without increasing activation cost too much
+4. keep only one implementation idea per iteration
+5. if a candidate beats the baseline in quality but violates the latency budget, simplify it before exploring more aggressive families
+6. use `pade_step_ratio` and `pade_call_ratio` only as diagnostics, not as primary optimization targets
+7. if a candidate crashes due to an obvious implementation bug, fix the bug and continue the same search direction
+
+## Candidate idea shortlist for `pade_formula_mn()`
+
+To avoid search drift, bias candidate selection toward the following families first.
+These are not mandatory, but they are the preferred search frontier for this phase.
+
+1. Weighted Taylor family
+   - Keep Taylor as the base approximation.
+   - Apply conservative decay or reweighting to higher-order terms.
+   - Prefer cheap, numerically stable variants first.
+
+2. Taylor plus light rational correction
+   - Use Taylor as the main path.
+   - Add a small rational correction only when the local coefficients look safe.
+   - Keep denominator handling conservative and cheap.
+
+3. Piecewise approximation family
+   - Use one formula in the safe region and fall back to Taylor in the risky region.
+   - Safe/risky decisions may depend on step distance, coefficient magnitude, derivative ratios, denominator margin, or finite-value checks.
+
+4. Blended hybrid family
+   - Blend between Taylor and a stronger approximation using a bounded confidence weight.
+   - Prefer smooth blending over hard switching when cost is similar.
+   - The blend must collapse back toward Taylor when confidence is low.
+
+5. Single-step-specialized family
+   - Since the current runtime bucket is conservative and often emphasizes short extrapolation, it is acceptable to design approximations specialized for the single-step case first.
+   - Do not optimize for broad generality before proving a win in the actual bucket.
+
+## Anti-drift guidance for candidate selection
+
+When choosing the next idea, prefer the following order:
+
+1. smallest change to `pade_formula_mn()` that tests one approximation-family hypothesis
+2. numerically safer candidate before more aggressive candidate
+3. cheaper candidate before more expensive candidate when quality upside is unclear
+4. fallback-to-Taylor design before fully replacing Taylor everywhere
+5. latency-budget-compliant candidate before marginally better but slower candidate
+
+Avoid drifting into the following unless the human explicitly asks:
+
+- reopening runtime-parameter search
+- redesigning `train.py` beyond bookkeeping or baseline logic
+- broad edits across multiple functions in `__init__.py` when `pade_formula_mn()` alone can express the hypothesis
+- optimizing Padé identity or theory for its own sake instead of optimizing the practical approximation family
+- increasing complexity without a clear path to staying within the latency budget
+
+## Output
+
+Each run prints a stable summary that starts with `---`.
+It includes the normal quality metrics and latency-aware comparison fields, including:
+
+- `status`
+- `paired_control_timestamp`
+- `paired_outcome`
+- `sample_seconds`
+- `latency_baseline_timestamp`
+- `latency_baseline_sample_seconds`
+- `sample_seconds_budget`
+- `sample_seconds_ratio`
+- `latency_within_budget`
+- `lpips`
+- `relative_l1`
+- `ssim`
+- `rmse`
+- `artifact_dir`
+
+`train.py` also appends one row to `results.tsv` automatically.
+
+## Reporting
+
+Keep progress reports concise. For each completed run, include:
+
+- the approximation-family candidate just tested
+- the short `pade_code_sha256`
+- whether it stayed within the latency budget
+- whether it beat, tied, or lost to the standing baseline
+- key metrics: `lpips`, `relative_l1`, `ssim`, `rmse`
+- `sample_seconds` and `sample_seconds_ratio`
+- the next planned candidate
+
+Immediately after reporting, start the next run unless an allowed blocker is present.
