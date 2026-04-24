@@ -48,28 +48,33 @@ You may inspect these external files as needed:
 
 中文解释：
 
-- 当前目标不是继续狭义地“调 Padé 参数”，也不是默认沿用 TaylorSeer 的项阻尼思路。
-- 当前阶段把 `pade_formula_mn()` 当成“经验多项式预测器”的统一实现接口。
-- `factors` 和 `x` 仍然是输入特征，但候选公式不需要保留 Taylor 语义；重点是探索更适合当前 bucket 的主流多项式基底与经验系数构造方式。
-- 判定标准分三层：先满足延迟预算，再超过 standing baseline，再比较是否超过当前 family champion。
+- 当前目标是找到一个能够在冻结 bucket 下真正替代 TaylorSeer 的新近似方法，而不是靠把近似缩到极少数 step、layer 或 module 上来“偷”一点点增益。
+- 当前阶段仍然把 `pade_formula_mn()` 当成统一实验接口，但候选方法应在公式形态上与 TaylorSeer 有实质差异，并在非平凡作用范围内体现效果。
+- `factors` 和 `x` 仍然是输入特征，但不要把门控、超稀疏启用、最后一步或倒数第二步特判当成主要创新来源。
+- 如果一个候选方法的主要收益来自“更少使用近似”而不是“更好的近似公式”，它不应被视为主线成功。
 
 Stop treating the current search as either a Padé-optimization task or a Taylor-term-retention task.
-Use `pade_formula_mn()` as the implementation hook for an empirical polynomial-family search tailored to this bucket.
-The input features may still come from the existing `factors` cache and step offset `x`, but the candidate formula does not need to preserve Taylor semantics.
+Use `pade_formula_mn()` as the implementation hook for discovering a genuinely stronger approximation family for this frozen bucket.
+The input features may still come from the existing `factors` cache and step offset `x`, but the candidate formula should aim to replace TaylorSeer behavior on a meaningful subset of the bucket, not merely gate itself down to near-zero usage.
 Allowed approximation families include, but are not limited to:
 
 - ordinary low-order polynomials in the monomial basis
 - Chebyshev polynomials
 - Legendre polynomials
 - Hermite-style cubic polynomials
-- piecewise polynomials
-- polynomial hybrids with bounded gates when the gate is cheap and attributable
+- low-order rational-polynomial hybrids
+- piecewise polynomials with a small number of interpretable regimes
+- coefficient-construction rules from `factors` that materially change the approximation behavior
+
+Gates are allowed only as secondary safety wrappers around a substantive approximation family.
+A gate-only, sparsity-only, or scope-only trick does not count as a new family discovery.
 
 The optimization target for this phase is:
 
-1. stay within the standing latency budget derived from the pure TaylorSeer baseline
-2. beat that baseline on image-quality metrics
-3. among baseline-beating candidates within budget, improve on the current best valid family candidate
+1. discover a substantively different approximation family that can beat the pure TaylorSeer baseline on image-quality metrics
+2. keep that family within the standing latency budget derived from the pure TaylorSeer baseline
+3. among within-budget candidates, prefer larger and more robust quality gains over ultra-conservative near-tie wins
+4. only treat a result as strategic progress if the gain comes from the formula itself rather than from sharply reducing where it is allowed to run
 
 Use run `20260329-171615` as the standing baseline reference for this phase.
 That baseline has:
@@ -87,6 +92,7 @@ Champion rule for this phase:
 
 - Standing baseline determines whether a candidate is valid at all.
 - A run is only a new search anchor if it is within budget, beats the standing baseline, and also beats the current best valid family candidate in the same frozen bucket.
+- A near-tie that wins only by tiny metric noise should not end the search for a materially better family.
 - A run that beats the standing baseline but does not beat the current family champion is informative, but it should not become the new retained champion or the main search anchor.
 
 ## Fixed evaluation bucket
@@ -155,9 +161,11 @@ These rules are strict unless the human explicitly overrides them.
 8. Keep the implementation scope narrow.
    - For ordinary candidate iterations, edit only `taylor_utils/__init__.py`.
    - Within that file, prefer to edit only `pade_formula_mn()`.
-9. Do not silently drift back into Taylor-term damping as the default search pattern.
-   - Taylor-weighted or Taylor-fallback candidates may be used only as explicit controls or clearly labeled side probes.
-   - The default frontier for this phase is polynomial-family exploration.
+9. Do not silently drift back into Taylor-term damping or gate-first sparsification as the default search pattern.
+   - Taylor-weighted, Taylor-fallback, last-step-only, penultimate-step-only, layer-only, or module-only candidates may be used only as explicit controls, side probes, or temporary rescue simplifications after a promising broader family proves too slow.
+   - The default frontier for this phase is substantive family replacement, not reducing activation count until the method is almost pure Taylor again.
+10. Do not treat scope restriction itself as the main innovation.
+   - A candidate whose primary change is a new gate, a tighter usage mask, or a more selective trigger should not be considered a frontier family candidate unless it is paired with a substantively new approximation formula.
 
 ## Metric policy
 
@@ -180,6 +188,28 @@ For retention and next-step planning, use a stricter rule:
 - passing the standing baseline means the run is valid
 - beating the current champion means the run becomes the new retained best family candidate
 - valid-but-not-champion runs should remain in `results.tsv`, but they should not replace the current retained champion as the search anchor
+
+### Metric interpretation
+
+中文说明：
+
+- `sample_seconds` 衡量一次采样实验的运行耗时，越低越好；但本阶段不是单纯追求最快，而是要求候选方法不能明显慢于 standing baseline。
+- `sample_seconds_ratio` 是当前耗时相对 standing baseline 的比例，`1.00` 表示与 baseline 基本相同，`1.05` 是本阶段允许的硬上限。
+- `latency_within_budget=true` 是质量比较的前置条件；如果延迟超预算，即使图像质量指标更好，也不算本阶段成功。
+- `LPIPS` 衡量感知差异，越低表示生成图像越接近 paired baseline/control，是本阶段质量排序的第一优先级。
+- `Relative L1` 衡量像素级相对绝对误差，越低越好；它作为 LPIPS 接近时的第二排序指标。
+- `SSIM` 衡量结构相似性，越高越好；它用于辅助判断结构是否保持得更好。
+- `RMSE` 衡量均方根误差，越低越好；它是最后的 tie-breaker，用于补充像素级误差判断。
+
+How to decide whether a result is good:
+
+1. First check latency: `latency_within_budget` must be true, with `sample_seconds_ratio <= 1.05`.
+2. Then compare quality against the standing baseline `20260329-171615`.
+3. A candidate is valid only if it is within budget and improves the ordered metric policy: lower `LPIPS`, then lower `Relative L1`, then higher `SSIM`, then lower `RMSE`.
+4. A valid candidate is only promoted to the retained family champion if it also beats the current best valid candidate in the same frozen bucket.
+
+Do not interpret the metric numbers as universal absolute quality thresholds.
+For this harness, "good" means better than the frozen standing baseline under the same evaluation bucket, and "best" means better than the current retained family champion under that same bucket.
 
 ## Setup
 
@@ -279,28 +309,28 @@ LOOP FOREVER until the human stops you:
 
 Suggested order:
 
-1. start with cheap polynomial families that are numerically stable in a short extrapolation regime
-2. prefer one polynomial-basis hypothesis at a time
-3. keep the active scope narrow before expanding to more steps or modules
-4. favor hypotheses that plausibly reduce error without increasing activation cost too much
-5. if a candidate beats the baseline in quality but violates the latency budget, simplify its scope before exploring more expressive families
-6. use `pade_step_ratio` and `pade_call_ratio` only as noisy diagnostics, not as decision variables
+1. start with approximation families that can replace TaylorSeer on a meaningful subset of the frozen bucket, not just on a tiny gated corner case
+2. prefer one new family hypothesis at a time
+3. favor hypotheses that plausibly reduce error through a better formula, basis, or coefficient construction rather than through narrower activation
+4. if a candidate is too slow, first simplify the arithmetic inside that family before shrinking it to fewer steps, layers, or modules
+5. only after a broader family shows real upside may you introduce limited scope restrictions to recover latency
+6. use `pade_step_ratio` and `pade_call_ratio` only as diagnostics, not as optimization targets
 7. if a candidate crashes due to an obvious implementation bug, fix the bug and continue the same search direction
 
 ## Candidate idea shortlist for `pade_formula_mn()`
 
-To avoid search drift, bias candidate selection toward the following polynomial families first.
-These are not mandatory, but they are the preferred search frontier for this phase.
+To avoid search drift, bias candidate selection toward the following families first.
+These are not mandatory, but they are the preferred frontier for this phase.
 
 1. Ordinary empirical cubic / quartic polynomial
    - Treat `factors` and `x` as features, not as a mandate to preserve Taylor coefficients exactly.
-   - Allow simple empirical coefficient constructions from `factors`.
-   - Start with the shortest, cheapest form that can differ meaningfully from Taylor.
+   - Prefer formulas that can plausibly run on a broad part of the frozen bucket.
+   - Start with the shortest, cheapest form that still differs meaningfully from TaylorSeer.
 
 2. Chebyshev polynomial family
    - Normalize `x` to a bounded interval first.
    - Use a low-order Chebyshev basis for numerical stability.
-   - Prefer compact coefficient rules that are easy to attribute.
+   - Prefer compact coefficient rules that materially change the approximation, not just its trigger condition.
 
 3. Legendre polynomial family
    - Use a normalized interval and low order.
@@ -308,25 +338,29 @@ These are not mandatory, but they are the preferred search frontier for this pha
 
 4. Hermite-style cubic family
    - Useful when reusing value and derivative-like information from `factors`.
-   - Do not default back to the raw Taylor cubic unless the run is explicitly labeled as a control.
+   - Prefer genuine Hermite-style interpolation behavior rather than Taylor damping with a new label.
 
-5. Piecewise polynomial family
-   - Different steps may use different low-order polynomial formulas.
-   - Prefer step-specialized or scope-specialized polynomial forms before expanding globally.
+5. Low-order rational-polynomial hybrid family
+   - Allow cheap rational corrections when they are numerically attributable and not just Padé nostalgia.
+   - Prefer hybrids that change the approximation law itself over ones that mostly add safety gates.
 
-6. Explicit Taylor-derived controls
-   - Weighted Taylor, cubic damping, or Taylor-plus-rational probes are allowed as named controls.
+6. Piecewise family with a small number of interpretable regimes
+   - Different ranges of `x`, derivative patterns, or local coefficient geometry may use different low-order formulas.
+   - Prefer a few meaningful regimes over ultra-sparse one-step special cases.
+
+7. Explicit controls
+   - Weighted Taylor, cubic damping, sparse gating, last-step-only probes, and Taylor-plus-rational variants are allowed as named controls.
    - They are not the default frontier for this phase.
 
 ## Anti-drift guidance for candidate selection
 
 When choosing the next idea, prefer the following order:
 
-1. smallest change to `pade_formula_mn()` that tests one approximation-family hypothesis
-2. a new polynomial basis before another tiny retention tweak on the same Taylor-shaped family
-3. numerically safer candidate before more aggressive candidate
-4. cheaper candidate before more expensive candidate when quality upside is unclear
-5. scope-specialized polynomial before global polynomial
+1. a family change that can plausibly deliver a material quality gain
+2. a new basis or coefficient-construction rule before another coefficient polish on the same family
+3. a broader replacement candidate before a narrower gated candidate
+4. simplification of a promising but too-slow family before introducing a tighter usage mask
+5. numerically safer candidate before more aggressive candidate when both are substantively new
 6. latency-budget-compliant candidate before marginally better but slower candidate
 
 Avoid drifting into the following unless the human explicitly asks:
@@ -335,7 +369,8 @@ Avoid drifting into the following unless the human explicitly asks:
 - redesigning `train.py` beyond bookkeeping or baseline logic
 - broad edits across multiple functions in `__init__.py` when `pade_formula_mn()` alone can express the hypothesis
 - optimizing Padé identity or theory for its own sake instead of optimizing the practical approximation family
-- defaulting back to Taylor-term damping because it is locally easy to express
+- repeated gate sweeps whose main effect is to use the approximation on fewer steps, layers, or modules
+- long runs of tiny coefficient tuning on the same sparse family without introducing a genuinely new approximation mechanism
 - increasing complexity without a clear path to staying within the latency budget
 
 ## Output
